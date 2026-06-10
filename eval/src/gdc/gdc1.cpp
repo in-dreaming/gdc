@@ -117,15 +117,28 @@ uint32_t getU32(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-// Writes one stream, choosing the smallest of {raw, rANS-o0, rANS-o1}.
+// Writes one stream, choosing the smallest of {raw, rANS-o0 with inline or
+// static table, rANS-o1}. kind selects the trained static table (one per
+// stream type); decode() dispatches via the stream header automatically.
 // mode: 0 = raw, 1 = order-0, 2 = order-1. Returns stored size.
-size_t storeStream(const std::vector<uint8_t>& s, bool entropy, bool allowO1,
+size_t storeStream(const std::vector<uint8_t>& s, bool entropy, int kind, bool allowO1,
                    uint8_t* dst, size_t cap, int& mode) {
     mode = 0;
     size_t best = SIZE_MAX;
-    if (entropy && s.size() >= 256) {
+    if (entropy && s.size() >= 64) {
         size_t r = rans::encode(s.data(), s.size(), dst, cap);
         if (r > 0) { mode = 1; best = r; }
+        // static table: no table bytes in the stream -> wins on small blocks
+        {
+            thread_local std::vector<uint8_t> alt;
+            if (alt.size() < cap) alt.resize(cap);
+            size_t rs = rans::encodeStatic(s.data(), s.size(), alt.data(), cap, kind);
+            if (rs > 0 && rs < best) {
+                std::memcpy(dst, alt.data(), rs);
+                mode = 1;
+                best = rs;
+            }
+        }
         // o1 has 16 tables of overhead; only worth probing on larger streams
         if (allowO1 && s.size() >= 16384) {
             thread_local std::vector<uint8_t> alt;
@@ -146,7 +159,13 @@ size_t storeStream(const std::vector<uint8_t>& s, bool entropy, bool allowO1,
     return s.size();
 }
 
+void (*g_trainHook)(int, const uint8_t*, size_t) = nullptr;
+
 } // namespace
+
+void setTrainHook(void (*hook)(int streamKind, const uint8_t* data, size_t n)) {
+    g_trainHook = hook;
+}
 
 size_t compressBound(size_t srcSize) {
     return srcSize + srcSize / 128 + 4096;
@@ -226,11 +245,14 @@ size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap,
     uint8_t* d = dst + HDR;
     size_t cap = dstCap - HDR;
     const std::vector<uint8_t>* streams[NS] = {&s.tokens, &s.exts, &s.lits, &s.offLo, &s.offHi};
+    if (g_trainHook) {
+        for (size_t k = 0; k < NS; k++) g_trainHook((int)k, streams[k]->data(), streams[k]->size());
+    }
     size_t enc[NS];
     uint8_t flags = 0;
     for (size_t k = 0; k < NS; k++) {
         int mode;
-        enc[k] = storeStream(*streams[k], cfg.entropy, /*allowO1=*/k == 2, d, cap, mode);
+        enc[k] = storeStream(*streams[k], cfg.entropy, (int)k, /*allowO1=*/k == 2, d, cap, mode);
         if (enc[k] == SIZE_MAX) return 0;
         if (mode != 0) flags |= (uint8_t)(1 << k);
         if (mode == 2) flags |= 32;

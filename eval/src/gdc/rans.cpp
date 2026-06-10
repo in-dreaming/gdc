@@ -1,4 +1,5 @@
 #include "rans.h"
+#include "static_tables.h"
 
 #include <cstring>
 #include <vector>
@@ -98,6 +99,45 @@ size_t readFreqTable(const uint8_t* src, size_t srcSize, uint16_t* freq) {
     return p;
 }
 
+// 4-way interleaved encode, backwards into tmp (emitted bytes end up in
+// forward consumption order for the decoder). Symbol i uses state (i & 3);
+// decoder mirrors this schedule exactly. Returns payload start (or nullptr
+// if the stream cannot shrink), fills st[4].
+const uint8_t* encodeCore(const uint8_t* src, size_t srcSize, const uint16_t* freq,
+                          const uint32_t* cum, std::vector<uint8_t>& tmp, uint32_t st[4]) {
+    if (tmp.size() < srcSize + 64) tmp.resize(srcSize + 64);
+    uint8_t* const tmpEnd = tmp.data() + tmp.size();
+    uint8_t* out = tmpEnd;
+    st[0] = st[1] = st[2] = st[3] = RANS_L;
+    for (size_t i = srcSize; i-- > 0;) {
+        uint32_t& x = st[i & 3];
+        uint8_t s = src[i];
+        uint32_t f = freq[s];
+        // 64-bit: f can be SCALE (single-symbol context) and 2^20*4096 = 2^32
+        // overflows u32 -> bogus renorms that desync the decoder
+        uint64_t xMax = ((uint64_t)(RANS_L >> SCALE_BITS) << 16) * f;
+        if (x >= xMax) { // at most one 16-bit renorm per symbol
+            if (out - tmp.data() < 2) return nullptr; // cannot shrink, bail out
+            out -= 2;
+            out[0] = (uint8_t)(x & 0xff);
+            out[1] = (uint8_t)((x >> 8) & 0xff);
+            x >>= 16;
+        }
+        x = ((x / f) << SCALE_BITS) + (x % f) + cum[s];
+    }
+    return out;
+}
+
+void writeStates(uint8_t*& d, const uint32_t st[4]) {
+    for (int k = 0; k < 4; k++) {
+        d[0] = (uint8_t)(st[k] & 0xff);
+        d[1] = (uint8_t)((st[k] >> 8) & 0xff);
+        d[2] = (uint8_t)((st[k] >> 16) & 0xff);
+        d[3] = (uint8_t)((st[k] >> 24) & 0xff);
+        d += 4;
+    }
+}
+
 } // namespace
 
 size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
@@ -111,31 +151,11 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
     cum[0] = 0;
     for (int i = 0; i < 256; i++) cum[i + 1] = cum[i] + freq[i];
 
-    // 2-way interleaved encode, backwards into a temp buffer (emitted bytes
-    // end up in forward consumption order for the decoder). Symbol i uses
-    // state (i & 1); decoder mirrors this schedule exactly.
     thread_local std::vector<uint8_t> tmp;
-    if (tmp.size() < srcSize + 64) tmp.resize(srcSize + 64);
-    uint8_t* const tmpEnd = tmp.data() + tmp.size();
-    uint8_t* out = tmpEnd;
-    uint32_t st[4] = {RANS_L, RANS_L, RANS_L, RANS_L};
-    for (size_t i = srcSize; i-- > 0;) {
-        uint32_t& x = st[i & 3];
-        uint8_t s = src[i];
-        uint32_t f = freq[s];
-        // 64-bit: f can be SCALE (single-symbol context) and 2^20*4096 = 2^32
-        // overflows u32 -> bogus renorms that desync the decoder
-        uint64_t xMax = ((uint64_t)(RANS_L >> SCALE_BITS) << 16) * f;
-        if (x >= xMax) { // at most one 16-bit renorm per symbol
-            if (out - tmp.data() < 2) return 0; // cannot shrink, bail out
-            out -= 2;
-            out[0] = (uint8_t)(x & 0xff);
-            out[1] = (uint8_t)((x >> 8) & 0xff);
-            x >>= 16;
-        }
-        x = ((x / f) << SCALE_BITS) + (x % f) + cum[s];
-    }
-    size_t payload = (size_t)(tmpEnd - out);
+    uint32_t st[4];
+    const uint8_t* out = encodeCore(src, srcSize, freq, cum, tmp, st);
+    if (!out) return 0;
+    size_t payload = (size_t)(tmp.data() + tmp.size() - out);
 
     // header: [u16 tableSize][table][u32 state0..3][payload]
     uint8_t table[3 * 256];
@@ -150,13 +170,37 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
     d += 2;
     std::memcpy(d, table, tableSize);
     d += tableSize;
-    for (int k = 0; k < 4; k++) {
-        d[0] = (uint8_t)(st[k] & 0xff);
-        d[1] = (uint8_t)((st[k] >> 8) & 0xff);
-        d[2] = (uint8_t)((st[k] >> 16) & 0xff);
-        d[3] = (uint8_t)((st[k] >> 24) & 0xff);
-        d += 4;
+    writeStates(d, st);
+    std::memcpy(d, out, payload);
+    return encSize;
+}
+
+// Static built-in table: header [u16 0x8000|id][u32 state0..3][payload].
+size_t encodeStatic(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap, int id) {
+    if (srcSize == 0 || dstCap < 18 || id < 0 || id >= kNumStaticTables) return 0;
+    const uint16_t* freq = kStaticFreq[id];
+    thread_local uint32_t cumCache[kNumStaticTables][257];
+    thread_local bool cumBuilt[kNumStaticTables] = {};
+    if (!cumBuilt[id]) {
+        cumCache[id][0] = 0;
+        for (int i = 0; i < 256; i++) cumCache[id][i + 1] = cumCache[id][i] + freq[i];
+        cumBuilt[id] = true;
     }
+
+    thread_local std::vector<uint8_t> tmp;
+    uint32_t st[4];
+    const uint8_t* out = encodeCore(src, srcSize, freq, cumCache[id], tmp, st);
+    if (!out) return 0;
+    size_t payload = (size_t)(tmp.data() + tmp.size() - out);
+
+    size_t encSize = 2 + 16 + payload;
+    if (encSize >= srcSize || encSize > dstCap) return 0;
+    uint8_t* d = dst;
+    uint16_t tag = (uint16_t)(0x8000 | id);
+    d[0] = (uint8_t)(tag & 0xff);
+    d[1] = (uint8_t)(tag >> 8);
+    d += 2;
+    writeStates(d, st);
     std::memcpy(d, out, payload);
     return encSize;
 }
@@ -164,24 +208,50 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
 size_t decode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t rawSize) {
     if (srcSize < 2 + 16) return 0;
     size_t tableSize = (size_t)(src[0] | (src[1] << 8));
-    if (2 + tableSize + 16 > srcSize) return 0;
-    uint16_t freq[256];
-    if (readFreqTable(src + 2, tableSize, freq) != tableSize) return 0;
-    const uint8_t* p = src + 2 + tableSize;
-    uint32_t cum[257];
-    cum[0] = 0;
-    for (int i = 0; i < 256; i++) {
-        cum[i + 1] = cum[i] + freq[i];
-        if (cum[i + 1] > SCALE) return 0;
-    }
-    if (cum[256] != SCALE) return 0;
+    const uint8_t* p;
+    const uint32_t* T;
 
-    // packed slot table: sym | (freq-1)<<8 | cum<<20  (one L1 load per symbol)
     thread_local std::vector<uint32_t> tbl;
-    if (tbl.size() < SCALE) tbl.resize(SCALE);
-    for (int s = 0; s < 256; s++) {
-        uint32_t e = (uint32_t)s | ((uint32_t)(freq[s] - 1) << 8) | ((uint32_t)cum[s] << 20);
-        for (uint32_t k = cum[s]; k < cum[s + 1]; k++) tbl[k] = e;
+    if (tableSize & 0x8000) {
+        // built-in static table; packed slot tables cached per id
+        int id = (int)(tableSize & 0x7fff);
+        if (id >= kNumStaticTables) return 0;
+        static thread_local std::vector<uint32_t> stbl[kNumStaticTables];
+        if (stbl[id].empty()) {
+            stbl[id].resize(SCALE);
+            const uint16_t* freq = kStaticFreq[id];
+            uint32_t cum = 0;
+            for (int s = 0; s < 256; s++) {
+                uint32_t f = freq[s];
+                if (f == 0) continue;
+                uint32_t e = (uint32_t)s | ((f - 1) << 8) | (cum << 20);
+                for (uint32_t k = 0; k < f; k++) stbl[id][cum + k] = e;
+                cum += f;
+            }
+            if (cum != SCALE) { stbl[id].clear(); return 0; }
+        }
+        T = stbl[id].data();
+        p = src + 2;
+    } else {
+        if (2 + tableSize + 16 > srcSize) return 0;
+        uint16_t freq[256];
+        if (readFreqTable(src + 2, tableSize, freq) != tableSize) return 0;
+        p = src + 2 + tableSize;
+        uint32_t cum[257];
+        cum[0] = 0;
+        for (int i = 0; i < 256; i++) {
+            cum[i + 1] = cum[i] + freq[i];
+            if (cum[i + 1] > SCALE) return 0;
+        }
+        if (cum[256] != SCALE) return 0;
+
+        // packed slot table: sym | (freq-1)<<8 | cum<<20  (one L1 load per symbol)
+        if (tbl.size() < SCALE) tbl.resize(SCALE);
+        for (int s = 0; s < 256; s++) {
+            uint32_t e = (uint32_t)s | ((uint32_t)(freq[s] - 1) << 8) | ((uint32_t)cum[s] << 20);
+            for (uint32_t k = cum[s]; k < cum[s + 1]; k++) tbl[k] = e;
+        }
+        T = tbl.data();
     }
 
     auto readState = [&]() {
@@ -192,7 +262,6 @@ size_t decode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t rawSize) 
     uint32_t st[4];
     for (int k = 0; k < 4; k++) st[k] = readState();
     const uint8_t* const pend = src + srcSize;
-    const uint32_t* const T = tbl.data();
 
     // 4 symbols per iteration: four independent dependency chains overlap in
     // the CPU pipeline; each state renorms at most once (16-bit) per symbol.
