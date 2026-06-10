@@ -1,6 +1,7 @@
 #include "gdc1.h"
 #include "rans.h"
 
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -15,19 +16,19 @@ constexpr size_t MAX_DIST = 0xffff;
 constexpr size_t HASH_LOG = 16;
 constexpr size_t CHAIN_MASK = 0xffff;
 
-// per-level tuning: {chain search depth, lazy parsing, entropy coding}
-struct LevelCfg { int depth; bool lazy; bool entropy; };
+// per-level tuning: {chain search depth, lazy parsing, entropy coding, optimal parse}
+struct LevelCfg { int depth; bool lazy; bool entropy; bool optimal; };
 const LevelCfg kLevels[10] = {
-    {2,   false, false}, // 0
-    {4,   false, false}, // 1
-    {8,   false, false}, // 2
-    {16,  false, true},  // 3
-    {24,  false, true},  // 4
-    {32,  true,  true},  // 5
-    {64,  true,  true},  // 6
-    {128, true,  true},  // 7
-    {256, true,  true},  // 8
-    {512, true,  true},  // 9
+    {2,   false, false, false}, // 0
+    {4,   false, false, false}, // 1
+    {8,   false, false, false}, // 2
+    {16,  false, true,  false}, // 3
+    {24,  false, true,  false}, // 4
+    {32,  true,  true,  false}, // 5
+    {64,  true,  true,  false}, // 6
+    {128, true,  true,  false}, // 7
+    {256, true,  true,  false}, // 8
+    {512, true,  true,  true},  // 9
 };
 
 inline uint32_t read32(const uint8_t* p) {
@@ -161,6 +162,220 @@ size_t storeStream(const std::vector<uint8_t>& s, bool entropy, int kind, bool a
 
 void (*g_trainHook)(int, const uint8_t*, size_t) = nullptr;
 
+// ---------- optimal parse (level 9) ----------
+// Forward DP over positions with an approximate bit-cost model; prices are in
+// 1/8-bit units. Tracks one rep-offset along the optimal path (zstd-style
+// approximation: exact rep tracking needs per-state DP, not worth it here).
+
+constexpr uint32_t INF_PRICE = 0xffffffffu;
+
+// per-symbol prices (1/8-bit units) derived from a first greedy pass over the
+// same input: -log2(p) of each stream's actual histogram, so the DP optimizes
+// against (an estimate of) the real post-rANS cost.
+struct PriceModel {
+    uint16_t lit[256];
+    uint16_t offLo[256];
+    uint16_t offHi[256];
+
+    static void fill(uint16_t* out, const uint64_t* hist, uint64_t total) {
+        for (int i = 0; i < 256; i++) {
+            if (hist[i] == 0 || total == 0) { out[i] = 12 * 8; continue; }
+            double bits = -std::log2((double)hist[i] / (double)total);
+            if (bits < 0.5) bits = 0.5;
+            if (bits > 12.0) bits = 12.0;
+            out[i] = (uint16_t)(bits * 8.0 + 0.5);
+        }
+    }
+    void build(const Streams& s) {
+        uint64_t h[256];
+        auto histOf = [&](const std::vector<uint8_t>& v) -> uint64_t {
+            std::memset(h, 0, sizeof(h));
+            for (uint8_t b : v) h[b]++;
+            return (uint64_t)v.size();
+        };
+        fill(lit, h, histOf(s.lits));
+        fill(offLo, h, histOf(s.offLo));
+        fill(offHi, h, histOf(s.offHi));
+    }
+    uint32_t matchPrice8(size_t mLen, size_t encDist) const {
+        // encDist == 0 means rep-offset
+        uint32_t bits8 = 64 /*token*/ + offLo[encDist & 0xff] + offHi[encDist >> 8];
+        size_t ml = mLen - MIN_MATCH;
+        if (ml >= 15) bits8 += 64 * (uint32_t)(1 + (ml - 15) / 255);
+        return bits8;
+    }
+};
+
+struct OptArrays {
+    std::vector<uint32_t> price, plen, pdist, rep;
+};
+
+void greedyParse(const uint8_t* src, size_t srcSize, const LevelCfg& cfg, int depth,
+                 MatchFinder& mf, Streams& s);
+
+// Returns false if input too large for DP (caller falls back to lazy parse).
+bool optimalParse(const uint8_t* src, size_t srcSize, const LevelCfg& cfg,
+                  MatchFinder& mf, Streams& s) {
+    if (srcSize > (8u << 20) || srcSize < MIN_MATCH + LAST_LITERALS + 8) return false;
+    const uint8_t* const end = src + srcSize;
+    const uint8_t* const matchLimit = end - LAST_LITERALS;
+    const size_t mfEnd = srcSize - (MIN_MATCH + LAST_LITERALS);
+
+    // pass 1: cheap greedy parse -> stream histograms -> symbol prices
+    thread_local Streams scratch;
+    scratch.tokens.clear(); scratch.exts.clear(); scratch.lits.clear();
+    scratch.offLo.clear(); scratch.offHi.clear();
+    greedyParse(src, srcSize, cfg, /*depth=*/32, mf, scratch);
+    thread_local PriceModel model;
+    model.build(scratch);
+    mf.reset();
+
+    thread_local OptArrays a;
+    size_t n = srcSize;
+    a.price.assign(n + 1, INF_PRICE);
+    a.plen.assign(n + 1, 0);
+    a.pdist.assign(n + 1, 0);
+    a.rep.assign(n + 1, 0);
+    a.price[0] = 0;
+
+    // find() runs at *every* position here (greedy only at match starts); on
+    // big inputs cap the chain depth to keep level 9 usable. Small files
+    // (prefab/asset) need the full depth -- shallow chains cost real ratio.
+    const int dpDepth = (n <= (256u << 10)) ? cfg.depth : (cfg.depth > 128 ? 128 : cfg.depth);
+
+    for (size_t i = 0; i < n; i++) {
+        uint32_t base = a.price[i];
+        if (base == INF_PRICE) continue;
+        // literal step
+        uint32_t lp = base + model.lit[src[i]];
+        if (lp < a.price[i + 1]) {
+            a.price[i + 1] = lp;
+            a.plen[i + 1] = 0;
+            a.rep[i + 1] = a.rep[i];
+        }
+        if (i > mfEnd) continue;
+
+        size_t dist = 0;
+        size_t len = mf.find(src, i, matchLimit, dpDepth, dist);
+        mf.insert(src, i);
+
+        // rep-offset candidate along the current optimal path
+        size_t repDist = a.rep[i];
+        size_t repLen = 0;
+        if (repDist && i >= repDist && src + i + MIN_MATCH <= matchLimit &&
+            read32(src + i - repDist) == read32(src + i)) {
+            repLen = MIN_MATCH;
+            while (src + i + repLen < matchLimit && src[i - repDist + repLen] == src[i + repLen]) repLen++;
+        }
+
+        auto relax = [&](size_t l, size_t d, bool isRep) {
+            uint32_t np = base + model.matchPrice8(l, isRep ? 0 : d);
+            if (np < a.price[i + l]) {
+                a.price[i + l] = np;
+                a.plen[i + l] = (uint32_t)l;
+                a.pdist[i + l] = (uint32_t)d;
+                a.rep[i + l] = (uint32_t)d;
+            }
+        };
+        // very long match: accept greedily and skip the covered region.
+        // Visiting every position inside a long run is O(n*len) (each find()
+        // re-extends a run-length match) and DP gains nothing there.
+        constexpr size_t GREEDY_LEN = 1024;
+        if (len >= GREEDY_LEN || repLen >= GREEDY_LEN) {
+            bool useRep = repLen + 1 >= len;
+            size_t gl = useRep ? repLen : len;
+            size_t gd = useRep ? repDist : dist;
+            relax(gl, gd, useRep || gd == repDist);
+            i += gl - 1; // skipped positions stay unreachable/un-inserted
+            continue;
+        }
+        if (len >= MIN_MATCH) {
+            for (size_t l = MIN_MATCH; l <= len; l++) relax(l, dist, dist == repDist);
+        }
+        if (repLen >= MIN_MATCH) {
+            for (size_t l = MIN_MATCH; l <= repLen; l++) relax(l, repDist, true);
+        }
+    }
+
+    // backtrace: collect (pos, len, dist) matches in reverse order
+    thread_local std::vector<uint32_t> mpos, mlen, mdist;
+    mpos.clear(); mlen.clear(); mdist.clear();
+    for (size_t j = n; j > 0;) {
+        uint32_t l = a.plen[j];
+        if (l == 0) { j -= 1; continue; }
+        j -= l;
+        mpos.push_back((uint32_t)j);
+        mlen.push_back(l);
+        mdist.push_back(a.pdist[j + l]);
+    }
+
+    const uint8_t* anchor = src;
+    size_t lastDist = 0;
+    for (size_t k = mpos.size(); k-- > 0;) {
+        const uint8_t* p = src + mpos[k];
+        emitSeq(s, anchor, (size_t)(p - anchor), mlen[k], mdist[k], lastDist);
+        anchor = p + mlen[k];
+    }
+    emitSeq(s, anchor, (size_t)(end - anchor), 0, 0, lastDist);
+    return true;
+}
+
+// greedy/lazy parse (levels 0..8, and pass 1 of the optimal parse)
+void greedyParse(const uint8_t* src, size_t srcSize, const LevelCfg& cfg, int depth,
+                 MatchFinder& mf, Streams& s) {
+    const uint8_t* const end = src + srcSize;
+    const uint8_t* const mfLimit = (srcSize > MIN_MATCH + LAST_LITERALS + 8)
+        ? end - (MIN_MATCH + LAST_LITERALS) : src;
+    const uint8_t* const matchLimit = end - LAST_LITERALS;
+    const uint8_t* anchor = src;
+    const uint8_t* p = src;
+    size_t lastDist = 0;
+
+    while (p < mfLimit) {
+        size_t dist = 0;
+        size_t len = mf.find(src, (size_t)(p - src), matchLimit, depth, dist);
+        // check repeat-offset match: ~free to encode, prefer when nearly as long
+        if (lastDist && (size_t)(p - src) >= lastDist && p + MIN_MATCH <= matchLimit) {
+            const uint8_t* c = p - lastDist;
+            if (read32(c) == read32(p)) {
+                size_t repLen = MIN_MATCH;
+                while (p + repLen < matchLimit && c[repLen] == p[repLen]) repLen++;
+                if (repLen + 1 >= len) { len = repLen; dist = lastDist; }
+            }
+        }
+        if (len >= MIN_MATCH) {
+            // single-step lazy: prefer a longer match starting one byte later
+            if (cfg.lazy && p + 1 < mfLimit) {
+                mf.insert(src, (size_t)(p - src));
+                size_t dist2 = 0;
+                size_t len2 = mf.find(src, (size_t)(p + 1 - src), matchLimit, depth, dist2);
+                if (len2 > len) {
+                    p++; // current byte becomes a literal
+                    len = len2;
+                    dist = dist2;
+                } else {
+                    // keep match at p; position already inserted
+                    emitSeq(s, anchor, (size_t)(p - anchor), len, dist, lastDist);
+                    for (size_t k = 1; k < len && p + k + MIN_MATCH <= matchLimit; k++)
+                        mf.insert(src, (size_t)(p - src) + k);
+                    p += len;
+                    anchor = p;
+                    continue;
+                }
+            }
+            emitSeq(s, anchor, (size_t)(p - anchor), len, dist, lastDist);
+            for (size_t k = 0; k < len && p + k + MIN_MATCH <= matchLimit; k++)
+                mf.insert(src, (size_t)(p - src) + k);
+            p += len;
+            anchor = p;
+        } else {
+            mf.insert(src, (size_t)(p - src));
+            p++;
+        }
+    }
+    emitSeq(s, anchor, (size_t)(end - anchor), 0, 0, lastDist); // terminal literal run
+}
+
 } // namespace
 
 void setTrainHook(void (*hook)(int streamKind, const uint8_t* data, size_t n)) {
@@ -187,57 +402,8 @@ size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap,
     thread_local MatchFinder mf;
     mf.reset();
 
-    const uint8_t* const end = src + srcSize;
-    const uint8_t* const mfLimit = (srcSize > MIN_MATCH + LAST_LITERALS + 8)
-        ? end - (MIN_MATCH + LAST_LITERALS) : src;
-    const uint8_t* const matchLimit = end - LAST_LITERALS;
-    const uint8_t* anchor = src;
-    const uint8_t* p = src;
-    size_t lastDist = 0;
-
-    while (p < mfLimit) {
-        size_t dist = 0;
-        size_t len = mf.find(src, (size_t)(p - src), matchLimit, cfg.depth, dist);
-        // check repeat-offset match: ~free to encode, prefer when nearly as long
-        if (lastDist && (size_t)(p - src) >= lastDist && p + MIN_MATCH <= matchLimit) {
-            const uint8_t* c = p - lastDist;
-            if (read32(c) == read32(p)) {
-                size_t repLen = MIN_MATCH;
-                while (p + repLen < matchLimit && c[repLen] == p[repLen]) repLen++;
-                if (repLen + 1 >= len) { len = repLen; dist = lastDist; }
-            }
-        }
-        if (len >= MIN_MATCH) {
-            // single-step lazy: prefer a longer match starting one byte later
-            if (cfg.lazy && p + 1 < mfLimit) {
-                mf.insert(src, (size_t)(p - src));
-                size_t dist2 = 0;
-                size_t len2 = mf.find(src, (size_t)(p + 1 - src), matchLimit, cfg.depth, dist2);
-                if (len2 > len) {
-                    p++; // current byte becomes a literal
-                    len = len2;
-                    dist = dist2;
-                } else {
-                    // keep match at p; position already inserted
-                    emitSeq(s, anchor, (size_t)(p - anchor), len, dist, lastDist);
-                    for (size_t k = 1; k < len && p + k + MIN_MATCH <= matchLimit; k++)
-                        mf.insert(src, (size_t)(p - src) + k);
-                    p += len;
-                    anchor = p;
-                    continue;
-                }
-            }
-            emitSeq(s, anchor, (size_t)(p - anchor), len, dist, lastDist);
-            for (size_t k = 0; k < len && p + k + MIN_MATCH <= matchLimit; k++)
-                mf.insert(src, (size_t)(p - src) + k);
-            p += len;
-            anchor = p;
-        } else {
-            mf.insert(src, (size_t)(p - src));
-            p++;
-        }
-    }
-    emitSeq(s, anchor, (size_t)(end - anchor), 0, 0, lastDist); // terminal literal run
+    if (!cfg.optimal || !optimalParse(src, srcSize, cfg, mf, s))
+        greedyParse(src, srcSize, cfg, cfg.depth, mf, s);
 
     const size_t NS = 5;
     const size_t HDR = 1 + 2 * NS * 4;
