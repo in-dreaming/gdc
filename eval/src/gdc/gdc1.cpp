@@ -491,16 +491,28 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
         return len;
     };
 
+    // fast-path margin: short lit runs (<15) copy a fixed 16B block (wild),
+    // skipping the variable-size memcpy and exact bounds checks
+    uint8_t* const oendSafe = rawSize > 64 ? oend - 64 : dst;
+
     while (op < oend) {
         if (tok >= tokEnd) return 0;
         uint8_t token = *tok++;
-        size_t litLen = readLen(token >> 4);
-        if (litLen == SIZE_MAX) return 0;
-        if ((size_t)(litEnd - lit) < litLen || (size_t)(oend - op) < litLen) return 0;
-        std::memcpy(op, lit, litLen);
-        lit += litLen;
-        op += litLen;
-        if (op == oend) break; // terminal sequence
+        size_t litLen = token >> 4;
+        if (litLen < 15 && op < oendSafe && (size_t)(litEnd - lit) >= 16) {
+            std::memcpy(op, lit, 16);
+            lit += litLen;
+            op += litLen;
+            // op < oend guaranteed (>=50B slack) -> never the terminal seq
+        } else {
+            litLen = readLen(litLen);
+            if (litLen == SIZE_MAX) return 0;
+            if ((size_t)(litEnd - lit) < litLen || (size_t)(oend - op) < litLen) return 0;
+            std::memcpy(op, lit, litLen);
+            lit += litLen;
+            op += litLen;
+            if (op == oend) break; // terminal sequence
+        }
         if (offLo >= offEnd) return 0;
         size_t dist = (size_t)*offLo++ | ((size_t)*offHi++ << 8);
         if (dist == 0) dist = lastDist; // rep-offset
