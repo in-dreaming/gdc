@@ -80,7 +80,8 @@ struct MatchFinder {
 };
 
 struct Streams {
-    std::vector<uint8_t> tokens; // token bytes + length extension bytes
+    std::vector<uint8_t> tokens; // pure token bytes (lit<<4 | mlen codes)
+    std::vector<uint8_t> exts;   // length extension bytes (lit + match, in order)
     std::vector<uint8_t> lits;
     std::vector<uint8_t> offLo;  // offset low bytes (near-uniform)
     std::vector<uint8_t> offHi;  // offset high bytes (highly skewed -> rANS)
@@ -98,14 +99,14 @@ void emitSeq(Streams& s, const uint8_t* lits, size_t litLen, size_t mLen, size_t
     size_t litCode = litLen < 15 ? litLen : 15;
     size_t mCode = mLen ? ((mLen - MIN_MATCH) < 15 ? (mLen - MIN_MATCH) : 15) : 0;
     s.tokens.push_back((uint8_t)((litCode << 4) | mCode));
-    if (litLen >= 15) putLenExt(s.tokens, litLen - 15);
+    if (litLen >= 15) putLenExt(s.exts, litLen - 15);
     s.lits.insert(s.lits.end(), lits, lits + litLen);
     if (mLen) {
         size_t enc = (dist == lastDist) ? 0 : dist;
         s.offLo.push_back((uint8_t)(enc & 0xff));
         s.offHi.push_back((uint8_t)(enc >> 8));
         lastDist = dist;
-        if (mLen - MIN_MATCH >= 15) putLenExt(s.tokens, mLen - MIN_MATCH - 15);
+        if (mLen - MIN_MATCH >= 15) putLenExt(s.exts, mLen - MIN_MATCH - 15);
     }
 }
 
@@ -135,17 +136,17 @@ size_t compressBound(size_t srcSize) {
 }
 
 // Layout:
-//   u8  flags (bit0..3 = tokens/lits/offLo/offHi rANS-coded)
-//   u32 rawTok, rawLit, rawOffLo, rawOffHi   (uncompressed stream sizes)
-//   u32 encTok, encLit, encOffLo, encOffHi   (stored stream sizes)
-//   [tokens][lits][offLo][offHi]
+//   u8  flags (bit0..4 = tokens/exts/lits/offLo/offHi rANS-coded)
+//   u32 raw[5]   (uncompressed stream sizes)
+//   u32 enc[5]   (stored stream sizes)
+//   [tokens][exts][lits][offLo][offHi]
 size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap, int level) {
     if (level < 0) level = 0;
     if (level > 9) level = 9;
     const LevelCfg& cfg = kLevels[level];
 
     thread_local Streams s;
-    s.tokens.clear(); s.lits.clear(); s.offLo.clear(); s.offHi.clear();
+    s.tokens.clear(); s.exts.clear(); s.lits.clear(); s.offLo.clear(); s.offHi.clear();
     thread_local MatchFinder mf;
     mf.reset();
 
@@ -201,14 +202,15 @@ size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap,
     }
     emitSeq(s, anchor, (size_t)(end - anchor), 0, 0, lastDist); // terminal literal run
 
-    const size_t HDR = 1 + 8 * 4;
+    const size_t NS = 5;
+    const size_t HDR = 1 + 2 * NS * 4;
     if (dstCap < HDR) return 0;
     uint8_t* d = dst + HDR;
     size_t cap = dstCap - HDR;
-    const std::vector<uint8_t>* streams[4] = {&s.tokens, &s.lits, &s.offLo, &s.offHi};
-    size_t enc[4];
+    const std::vector<uint8_t>* streams[NS] = {&s.tokens, &s.exts, &s.lits, &s.offLo, &s.offHi};
+    size_t enc[NS];
     uint8_t flags = 0;
-    for (int k = 0; k < 4; k++) {
+    for (size_t k = 0; k < NS; k++) {
         bool r;
         enc[k] = storeStream(*streams[k], cfg.entropy, d, cap, r);
         if (enc[k] == SIZE_MAX) return 0;
@@ -217,31 +219,32 @@ size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap,
     }
 
     dst[0] = flags;
-    for (int k = 0; k < 4; k++) {
+    for (size_t k = 0; k < NS; k++) {
         putU32(dst + 1 + 4 * k, (uint32_t)streams[k]->size());
-        putU32(dst + 17 + 4 * k, (uint32_t)enc[k]);
+        putU32(dst + 1 + 4 * (NS + k), (uint32_t)enc[k]);
     }
     return (size_t)(d - dst);
 }
 
 size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawSize) {
-    const size_t HDR = 1 + 8 * 4;
+    const size_t NS = 5;
+    const size_t HDR = 1 + 2 * NS * 4;
     if (compSize < HDR) return 0;
     uint8_t flags = src[0];
-    size_t raw[4], enc[4];
+    size_t raw[NS], enc[NS];
     size_t encTotal = 0;
-    for (int k = 0; k < 4; k++) {
+    for (size_t k = 0; k < NS; k++) {
         raw[k] = getU32(src + 1 + 4 * k);
-        enc[k] = getU32(src + 17 + 4 * k);
+        enc[k] = getU32(src + 1 + 4 * (NS + k));
         encTotal += enc[k];
     }
     if (HDR + encTotal != compSize) return 0;
-    if (raw[2] != raw[3]) return 0; // offLo/offHi must pair up
+    if (raw[3] != raw[4]) return 0; // offLo/offHi must pair up
 
-    thread_local std::vector<uint8_t> bufs[4];
+    thread_local std::vector<uint8_t> bufs[NS];
     const uint8_t* p = src + HDR;
-    const uint8_t* sp[4];
-    for (int k = 0; k < 4; k++) {
+    const uint8_t* sp[NS];
+    for (size_t k = 0; k < NS; k++) {
         if (flags & (1 << k)) {
             if (bufs[k].size() < raw[k]) bufs[k].resize(raw[k]);
             if (rans::decode(p, enc[k], bufs[k].data(), raw[k]) != raw[k]) return 0;
@@ -253,12 +256,14 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
         p += enc[k];
     }
     const uint8_t* tok = sp[0];
-    const uint8_t* lit = sp[1];
-    const uint8_t* offLo = sp[2];
-    const uint8_t* offHi = sp[3];
+    const uint8_t* ext = sp[1];
+    const uint8_t* lit = sp[2];
+    const uint8_t* offLo = sp[3];
+    const uint8_t* offHi = sp[4];
     const uint8_t* const tokEnd = tok + raw[0];
-    const uint8_t* const litEnd = lit + raw[1];
-    const uint8_t* const offEnd = offLo + raw[2];
+    const uint8_t* const extEnd = ext + raw[1];
+    const uint8_t* const litEnd = lit + raw[2];
+    const uint8_t* const offEnd = offLo + raw[3];
 
     uint8_t* op = dst;
     uint8_t* const oend = dst + rawSize;
@@ -268,8 +273,8 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
         if (base == 15) {
             uint8_t b;
             do {
-                if (tok >= tokEnd) return SIZE_MAX;
-                b = *tok++;
+                if (ext >= extEnd) return SIZE_MAX;
+                b = *ext++;
                 len += b;
             } while (b == 255);
         }
