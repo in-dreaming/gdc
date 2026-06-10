@@ -5,3 +5,14 @@ commit	experiment	dataset	ratio	comp_MBps	decomp_MBps	fail	status	description
 2b565a3	kraken:7	ress1500	1.500	5.1	933.8	0	keep	reference (no-asm build, speed understated)
 B8	gdc1:9	page16k-ress600	1.320	51.4	224.0	0	keep	RLE freq table + entropy threshold 256: ratio +3.2% on 16KB pages; decomp slower (more small streams entropy-coded), to be fixed by B1/B3
 B8	gdc1:9	ress1500	1.387	26.4	209.1	0	keep	whole-file ratio +0.4%
+B3	gdc1:9	ress1500	1.387	28.7	225.4	0	keep	wild-copy match copy: decomp +8%
+B1	gdc1:9	ress1500	1.386	30.6	353.2	0	keep	2-way interleaved rANS + packed slot table: decomp +57%
+B1	gdc1:9	asset2k	1.274	33.8	496.6	0	keep	asset subset decomp 497MB/s
+B4	gdc1:9	ress1500	1.388	28.9	339.5	0	keep	rep-offset: ratio +0.1%, offsets stream skewed for rANS
+B4	gdc1:9	bytes2k	2.180	44.6	1269.7	0	keep	vs zstd@9 2.462/270MBps: faster but ratio behind on small tables
+B4	gdc1:9	prefab2k	2.999	15.6	611.6	0	keep	vs zstd@9 3.138/791MBps
+B5	gdc1:9	ress1500	1.373	10.6	278.2	0	revert	3B offsets + 2MB window: offset cost > window gain on ress, comp speed collapsed (asset2k 2MBps)
+T1/B9	autoplane+gdc1:9	ress1500	1.387	18.8	303.0	0	keep	autoplane(64KB seg, zstd-1 probe, 6% margin): neutral on ress (textures not raw block data)
+T1/B9	autoplane+gdc1:9	asset2k	1.678	18.3	379.0	0	keep	vs gdc1:9 1.581: +6.2%! assets contain plane-friendly numeric arrays
+T1/B9	autoplane+zstd:9	asset2k	1.707	26.0	810.0	0	keep	transform also helps zstd +5.7% => transform layer is backend-agnostic win
+T1/B9	autoplane+gdc1:9	anim2k	1.283	24.0	477.0	0	keep	anim neutral

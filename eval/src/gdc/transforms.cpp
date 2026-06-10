@@ -1,6 +1,9 @@
 #include "transforms.h"
 
 #include <cstring>
+#include <vector>
+
+#include "zstd.h"
 
 namespace gdc {
 
@@ -10,31 +13,39 @@ namespace {
 // then all byte-1s, ... Tail bytes (n % stride) are copied verbatim.
 // Turns "interleaved bit-field blocks" (ASTC/BCn) into per-field streams
 // that LZ + entropy stages model far better.
+void planeFwd(const uint8_t* src, size_t n, uint8_t* dst, size_t stride) {
+    const size_t blocks = n / stride;
+    for (size_t p = 0; p < stride; p++) {
+        uint8_t* out = dst + p * blocks;
+        const uint8_t* in = src + p;
+        for (size_t i = 0; i < blocks; i++) out[i] = in[i * stride];
+    }
+    std::memcpy(dst + blocks * stride, src + blocks * stride, n - blocks * stride);
+}
+
+void planeInv(const uint8_t* src, size_t n, uint8_t* dst, size_t stride) {
+    const size_t blocks = n / stride;
+    for (size_t p = 0; p < stride; p++) {
+        const uint8_t* in = src + p * blocks;
+        uint8_t* out = dst + p;
+        for (size_t i = 0; i < blocks; i++) out[i * stride] = in[i];
+    }
+    std::memcpy(dst + blocks * stride, src + blocks * stride, n - blocks * stride);
+}
+
 class PlaneTransform final : public ITransform {
 public:
     PlaneTransform(const char* name, size_t stride) : m_name(name), m_stride(stride) {}
     const char* name() const override { return m_name; }
-
-    void forward(const uint8_t* src, size_t n, uint8_t* dst) const override {
-        const size_t stride = m_stride;
-        const size_t blocks = n / stride;
-        for (size_t p = 0; p < stride; p++) {
-            uint8_t* out = dst + p * blocks;
-            const uint8_t* in = src + p;
-            for (size_t i = 0; i < blocks; i++) out[i] = in[i * stride];
-        }
-        std::memcpy(dst + blocks * stride, src + blocks * stride, n - blocks * stride);
+    size_t forward(const uint8_t* src, size_t n, uint8_t* dst, size_t cap) const override {
+        if (cap < n) return 0;
+        planeFwd(src, n, dst, m_stride);
+        return n;
     }
-
-    void inverse(const uint8_t* src, size_t n, uint8_t* dst) const override {
-        const size_t stride = m_stride;
-        const size_t blocks = n / stride;
-        for (size_t p = 0; p < stride; p++) {
-            const uint8_t* in = src + p * blocks;
-            uint8_t* out = dst + p;
-            for (size_t i = 0; i < blocks; i++) out[i * stride] = in[i];
-        }
-        std::memcpy(dst + blocks * stride, src + blocks * stride, n - blocks * stride);
+    size_t inverse(const uint8_t* src, size_t encN, uint8_t* dst, size_t rawN) const override {
+        if (encN != rawN) return 0;
+        planeInv(src, rawN, dst, m_stride);
+        return rawN;
     }
 
 private:
@@ -47,18 +58,112 @@ private:
 class Delta8Transform final : public ITransform {
 public:
     const char* name() const override { return "delta8"; }
-    void forward(const uint8_t* src, size_t n, uint8_t* dst) const override {
+    size_t forward(const uint8_t* src, size_t n, uint8_t* dst, size_t cap) const override {
+        if (cap < n) return 0;
         uint8_t prev = 0;
         for (size_t i = 0; i < n; i++) {
             dst[i] = (uint8_t)(src[i] - prev);
             prev = src[i];
         }
+        return n;
     }
-    void inverse(const uint8_t* src, size_t n, uint8_t* dst) const override {
+    size_t inverse(const uint8_t* src, size_t encN, uint8_t* dst, size_t rawN) const override {
+        if (encN != rawN) return 0;
         uint8_t acc = 0;
-        for (size_t i = 0; i < n; i++) {
+        for (size_t i = 0; i < rawN; i++) {
             acc = (uint8_t)(acc + src[i]);
             dst[i] = acc;
+        }
+        return rawN;
+    }
+};
+
+// Per-segment automatic stride selection ("mini-OpenZL"). Game archives mix
+// texture payloads (plane-friendly) with serialized headers (plane-hostile)
+// inside one file; a global stride loses both ways. For each 64KB segment we
+// trial-compress every candidate with zstd-1 (offline cost only) and keep
+// the winner; decode side just reads 1 tag byte per segment.
+// Layout: [u8 tag per segment][transformed segments back to back].
+class AutoPlaneTransform final : public ITransform {
+public:
+    static constexpr size_t SEG = 64 * 1024;
+    enum : uint8_t { TAG_COPY = 0, TAG_P4 = 1, TAG_P8 = 2, TAG_P16 = 3 };
+
+    const char* name() const override { return "autoplane"; }
+    size_t maxOutput(size_t n) const override { return n + numSegs(n) + 16; }
+
+    size_t forward(const uint8_t* src, size_t n, uint8_t* dst, size_t cap) const override {
+        const size_t nSeg = numSegs(n);
+        if (cap < nSeg + n) return 0;
+        uint8_t* tags = dst;
+        uint8_t* out = dst + nSeg;
+
+        thread_local std::vector<uint8_t> cand, probe;
+        for (size_t s = 0; s < nSeg; s++) {
+            const size_t off = s * SEG;
+            const size_t len = (n - off < SEG) ? (n - off) : SEG;
+            const uint8_t* sp = src + off;
+            uint8_t* op = out + off;
+
+            if (cand.size() < len) cand.resize(len);
+            size_t pb = ZSTD_compressBound(len);
+            if (probe.size() < pb) probe.resize(pb);
+
+            // candidate 0: copy
+            size_t bestSize = zstdProbe(sp, len, probe);
+            uint8_t bestTag = TAG_COPY;
+            static const size_t strides[3] = {4, 8, 16};
+            static const uint8_t tagOf[3] = {TAG_P4, TAG_P8, TAG_P16};
+            for (int c = 0; c < 3; c++) {
+                planeFwd(sp, len, cand.data(), strides[c]);
+                size_t sz = zstdProbe(cand.data(), len, probe);
+                // require a real margin: the probe codec (zstd-1) is weaker
+                // than the final backend, and the split costs cross-segment
+                // matches; small probe wins don't transfer
+                if (sz + (bestSize >> 4) < bestSize) {
+                    bestSize = sz;
+                    bestTag = tagOf[c];
+                }
+            }
+            tags[s] = bestTag;
+            applyFwd(sp, len, op, bestTag);
+        }
+        return nSeg + n;
+    }
+
+    size_t inverse(const uint8_t* src, size_t encN, uint8_t* dst, size_t rawN) const override {
+        const size_t nSeg = numSegs(rawN);
+        if (encN != nSeg + rawN) return 0;
+        const uint8_t* tags = src;
+        const uint8_t* in = src + nSeg;
+        for (size_t s = 0; s < nSeg; s++) {
+            const size_t off = s * SEG;
+            const size_t len = (rawN - off < SEG) ? (rawN - off) : SEG;
+            switch (tags[s]) {
+                case TAG_COPY: std::memcpy(dst + off, in + off, len); break;
+                case TAG_P4:  planeInv(in + off, len, dst + off, 4); break;
+                case TAG_P8:  planeInv(in + off, len, dst + off, 8); break;
+                case TAG_P16: planeInv(in + off, len, dst + off, 16); break;
+                default: return 0;
+            }
+        }
+        return rawN;
+    }
+
+private:
+    static size_t numSegs(size_t n) { return (n + SEG - 1) / SEG; }
+
+    static size_t zstdProbe(const uint8_t* p, size_t n, std::vector<uint8_t>& buf) {
+        size_t r = ZSTD_compress(buf.data(), buf.size(), p, n, 1);
+        return ZSTD_isError(r) ? n : r;
+    }
+
+    static void applyFwd(const uint8_t* src, size_t n, uint8_t* dst, uint8_t tag) {
+        switch (tag) {
+            case TAG_P4:  planeFwd(src, n, dst, 4); break;
+            case TAG_P8:  planeFwd(src, n, dst, 8); break;
+            case TAG_P16: planeFwd(src, n, dst, 16); break;
+            default: std::memcpy(dst, src, n); break;
         }
     }
 };
@@ -71,11 +176,13 @@ const ITransform* getTransform(const std::string& name) {
     static PlaneTransform s_p8("plane8", 8);
     static PlaneTransform s_p16("plane16", 16);
     static Delta8Transform s_d8;
+    static AutoPlaneTransform s_auto;
     if (name == "plane2") return &s_p2;
     if (name == "plane4") return &s_p4;
     if (name == "plane8") return &s_p8;
     if (name == "plane16") return &s_p16;
     if (name == "delta8") return &s_d8;
+    if (name == "autoplane") return &s_auto;
     return nullptr;
 }
 

@@ -220,6 +220,9 @@ public:
 
 // ---------------- transform pipeline ----------------
 
+// Transforms may grow the data (self-describing headers), so the container
+// stores a u32 per transform = size after that forward pass. Layout:
+//   [u32 size_after_tf0]...[u32 size_after_tfk-1][backend stream]
 class PipelineCodec final : public ICodec {
 public:
     PipelineCodec(std::vector<const ITransform*> tf, const ICodec* backend, std::string name)
@@ -227,39 +230,66 @@ public:
 
     CompType type() const override { return m_backend->type(); }
     std::string name() const override { return m_name; }
-    size_t compressBound(size_t srcSize) const override { return m_backend->compressBound(srcSize); }
+    size_t compressBound(size_t srcSize) const override {
+        size_t n = srcSize;
+        for (const ITransform* t : m_tf) n = t->maxOutput(n);
+        return 4 * m_tf.size() + m_backend->compressBound(n);
+    }
 
     size_t compress(const void* src, size_t srcSize, void* dst, size_t dstCap, int level) const override {
+        if (m_tf.empty()) return m_backend->compress(src, srcSize, dst, dstCap, level);
+        const size_t hdr = 4 * m_tf.size();
+        if (dstCap < hdr) return 0;
         thread_local std::vector<uint8_t> a, b;
         const uint8_t* cur = (const uint8_t*)src;
+        size_t curN = srcSize;
         bool useA = true;
-        for (const ITransform* t : m_tf) {
+        for (size_t i = 0; i < m_tf.size(); i++) {
             std::vector<uint8_t>& out = useA ? a : b;
-            if (out.size() < srcSize) out.resize(srcSize);
-            t->forward(cur, srcSize, out.data());
+            size_t cap = m_tf[i]->maxOutput(curN);
+            if (out.size() < cap) out.resize(cap);
+            size_t outN = m_tf[i]->forward(cur, curN, out.data(), out.size());
+            if (outN == 0 && curN != 0) return 0;
             cur = out.data();
+            curN = outN;
             useA = !useA;
+            uint8_t* h = (uint8_t*)dst + 4 * i;
+            h[0] = (uint8_t)curN; h[1] = (uint8_t)(curN >> 8);
+            h[2] = (uint8_t)(curN >> 16); h[3] = (uint8_t)(curN >> 24);
         }
-        return m_backend->compress(cur, srcSize, dst, dstCap, level);
+        size_t c = m_backend->compress(cur, curN, (uint8_t*)dst + hdr, dstCap - hdr, level);
+        return c ? hdr + c : 0;
     }
 
     size_t decompress(const void* src, size_t compSize, void* dst, size_t rawSize) const override {
         if (m_tf.empty()) return m_backend->decompress(src, compSize, dst, rawSize);
+        const size_t k = m_tf.size();
+        const size_t hdr = 4 * k;
+        if (compSize < hdr) return 0;
+        const uint8_t* h = (const uint8_t*)src;
+        thread_local std::vector<size_t> sizes;
+        sizes.resize(k);
+        for (size_t i = 0; i < k; i++) {
+            const uint8_t* p = h + 4 * i;
+            sizes[i] = (size_t)p[0] | ((size_t)p[1] << 8) | ((size_t)p[2] << 16) | ((size_t)p[3] << 24);
+        }
         thread_local std::vector<uint8_t> a, b;
-        if (a.size() < rawSize) a.resize(rawSize);
-        if (m_backend->decompress(src, compSize, a.data(), rawSize) != rawSize) return 0;
+        if (a.size() < sizes[k - 1]) a.resize(sizes[k - 1]);
+        if (m_backend->decompress(h + hdr, compSize - hdr, a.data(), sizes[k - 1]) != sizes[k - 1]) return 0;
         const uint8_t* cur = a.data();
         // apply inverse transforms in reverse order; last one writes to dst
-        for (size_t i = m_tf.size(); i-- > 0;) {
+        for (size_t i = k; i-- > 0;) {
+            size_t encN = sizes[i];
+            size_t rawN = (i == 0) ? rawSize : sizes[i - 1];
             uint8_t* out;
             if (i == 0) {
                 out = (uint8_t*)dst;
             } else {
                 std::vector<uint8_t>& buf = (cur == a.data()) ? b : a;
-                if (buf.size() < rawSize) buf.resize(rawSize);
+                if (buf.size() < rawN) buf.resize(rawN);
                 out = buf.data();
             }
-            m_tf[i]->inverse(cur, rawSize, out);
+            if (m_tf[i]->inverse(cur, encN, out, rawN) != rawN) return 0;
             cur = out;
         }
         return rawSize;
