@@ -274,8 +274,18 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
         mLen += MIN_MATCH;
         if (dist == 0 || (size_t)(op - dst) < dist || (size_t)(oend - op) < mLen) return 0;
         const uint8_t* m = op - dist;
-        for (size_t i = 0; i < mLen; i++) op[i] = m[i]; // overlap-safe
-        op += mLen;
+        uint8_t* const cpEnd = op + mLen;
+        if (dist >= 8 && (size_t)(oend - op) >= mLen + 8) {
+            // wild copy: 8B chunks, may overshoot into the slack region
+            do {
+                std::memcpy(op, m, 8);
+                op += 8; m += 8;
+            } while (op < cpEnd);
+            op = cpEnd;
+        } else {
+            for (size_t i = 0; i < mLen; i++) op[i] = m[i]; // overlap-safe
+            op += mLen;
+        }
     }
     return op == oend ? rawSize : 0;
 }
