@@ -44,12 +44,15 @@ struct BlockTask {
     int level;
     const uint8_t* src;
     size_t size;
+    const uint8_t* dict = nullptr; // optional shared dict (dict-capable codecs only)
+    size_t dictSize = 0;
 };
 
 // Runs one block through compress (+verify decompress), updating agg.
 void runBlock(const BlockTask& t, int repeat, bool verify, LocalState& ls, Agg& agg) {
     const ICodec* codec = t.codec;
     if (!codec) { agg.failures++; return; }
+    const bool useDict = t.dict && t.dictSize && codec->supportsDict();
 
     agg.blocks++;
     agg.rawBytes += t.size;
@@ -62,7 +65,10 @@ void runBlock(const BlockTask& t, int repeat, bool verify, LocalState& ls, Agg& 
     double bestC = 1e30;
     for (int i = 0; i < repeat; i++) {
         auto t0 = Clock::now();
-        compSize = codec->compress(t.src, t.size, ls.compBuf.data(), ls.compBuf.size(), t.level);
+        compSize = useDict
+            ? codec->compressDict(t.src, t.size, ls.compBuf.data(), ls.compBuf.size(), t.level,
+                                  t.dict, t.dictSize)
+            : codec->compress(t.src, t.size, ls.compBuf.data(), ls.compBuf.size(), t.level);
         double dt = secondsSince(t0);
         bestC = std::min(bestC, dt);
         if (compSize == 0) break;
@@ -76,7 +82,10 @@ void runBlock(const BlockTask& t, int repeat, bool verify, LocalState& ls, Agg& 
     double bestD = 1e30;
     for (int i = 0; i < repeat; i++) {
         auto t0 = Clock::now();
-        got = codec->decompress(ls.compBuf.data(), compSize, ls.verifyBuf.data(), t.size);
+        got = useDict
+            ? codec->decompressDict(ls.compBuf.data(), compSize, ls.verifyBuf.data(), t.size,
+                                    t.dict, t.dictSize)
+            : codec->decompress(ls.compBuf.data(), compSize, ls.verifyBuf.data(), t.size);
         double dt = secondsSince(t0);
         bestD = std::min(bestD, dt);
         if (got == 0) break;
@@ -121,9 +130,38 @@ std::vector<FileEntry> loadEntries(const RunOptions& opt, RunResult& result) {
     return entries;
 }
 
+// Builds a shared raw-content dictionary by sampling head bytes of the first
+// entries (T6 experiments). Deterministic; only aggregated bytes are kept in
+// memory, nothing is printed.
+std::vector<uint8_t> buildDict(const std::vector<FileEntry>& entries, const RunOptions& opt) {
+    std::vector<uint8_t> dict;
+    if (opt.dictSize == 0) return dict;
+    fs::path rawRoot = fs::path(opt.dataRoot) / "raw";
+    const size_t nSamples = 64;
+    const size_t perFile = (size_t)(opt.dictSize + nSamples - 1) / nSamples;
+    std::vector<uint8_t> buf;
+    for (const FileEntry& fe : entries) {
+        if (dict.size() >= opt.dictSize) break;
+        fs::path fp = rawRoot / fs::u8path(fe.rawRel);
+        buf.clear();
+        if (!readFileBytes(fp, buf)) {
+            std::string srcRel = fe.srcPath;
+            if (!srcRel.empty() && (srcRel[0] == '/' || srcRel[0] == '\\')) srcRel.erase(0, 1);
+            if (srcRel.empty() || !readFileBytes(rawRoot / fs::u8path(srcRel), buf)) continue;
+        }
+        size_t take = std::min(perFile, buf.size());
+        take = std::min(take, (size_t)opt.dictSize - dict.size());
+        dict.insert(dict.end(), buf.begin(), buf.begin() + take);
+    }
+    std::printf("dict: built %zu bytes from head samples\n", dict.size());
+    return dict;
+}
+
 void runEntries(const std::vector<FileEntry>& entries, const RunOptions& opt,
                 SharedStats& shared, bool baselineMode) {
     fs::path rawRoot = fs::path(opt.dataRoot) / "raw";
+    std::vector<uint8_t> dict;
+    if (!baselineMode) dict = buildDict(entries, opt);
     std::atomic<size_t> next{0};
     std::atomic<uint64_t> missing{0};
     std::atomic<size_t> done{0};
@@ -195,7 +233,8 @@ void runEntries(const std::vector<FileEntry>& entries, const RunOptions& opt,
                     } else {
                         for (uint64_t off = 0; off < fileSize; off += chunkSize) {
                             uint64_t n = std::min(chunkSize, fileSize - off);
-                            BlockTask task{rc.codec, rc.level, ls.fileBuf.data() + off, (size_t)n};
+                            BlockTask task{rc.codec, rc.level, ls.fileBuf.data() + off, (size_t)n,
+                                           dict.empty() ? nullptr : dict.data(), dict.size()};
                             runBlock(task, opt.repeat, opt.verify, ls, agg);
                         }
                     }

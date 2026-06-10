@@ -216,6 +216,17 @@ public:
     size_t decompress(const void* src, size_t compSize, void* dst, size_t rawSize) const override {
         return gdc1::decompress((const uint8_t*)src, compSize, (uint8_t*)dst, rawSize);
     }
+    bool supportsDict() const override { return true; }
+    size_t compressDict(const void* src, size_t srcSize, void* dst, size_t dstCap, int level,
+                        const void* dict, size_t dictSize) const override {
+        return gdc1::compressDict((const uint8_t*)src, srcSize, (uint8_t*)dst, dstCap, level,
+                                  (const uint8_t*)dict, dictSize);
+    }
+    size_t decompressDict(const void* src, size_t compSize, void* dst, size_t rawSize,
+                          const void* dict, size_t dictSize) const override {
+        return gdc1::decompressDict((const uint8_t*)src, compSize, (uint8_t*)dst, rawSize,
+                                    (const uint8_t*)dict, dictSize);
+    }
 };
 
 // ---------------- transform pipeline ----------------

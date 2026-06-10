@@ -211,7 +211,7 @@ struct OptArrays {
 };
 
 void greedyParse(const uint8_t* src, size_t srcSize, const LevelCfg& cfg, int depth,
-                 MatchFinder& mf, Streams& s);
+                 MatchFinder& mf, Streams& s, size_t startPos = 0);
 
 // Returns false if input too large for DP (caller falls back to lazy parse).
 bool optimalParse(const uint8_t* src, size_t srcSize, const LevelCfg& cfg,
@@ -320,15 +320,17 @@ bool optimalParse(const uint8_t* src, size_t srcSize, const LevelCfg& cfg,
     return true;
 }
 
-// greedy/lazy parse (levels 0..8, and pass 1 of the optimal parse)
+// greedy/lazy parse (levels 0..8, and pass 1 of the optimal parse).
+// startPos > 0 = prefix-dictionary mode: bytes [0, startPos) are window-only
+// context (already inserted into mf by the caller), output covers [startPos, n).
 void greedyParse(const uint8_t* src, size_t srcSize, const LevelCfg& cfg, int depth,
-                 MatchFinder& mf, Streams& s) {
+                 MatchFinder& mf, Streams& s, size_t startPos) {
     const uint8_t* const end = src + srcSize;
-    const uint8_t* const mfLimit = (srcSize > MIN_MATCH + LAST_LITERALS + 8)
-        ? end - (MIN_MATCH + LAST_LITERALS) : src;
+    const uint8_t* const mfLimit = (srcSize > startPos + MIN_MATCH + LAST_LITERALS + 8)
+        ? end - (MIN_MATCH + LAST_LITERALS) : src + startPos;
     const uint8_t* const matchLimit = end - LAST_LITERALS;
-    const uint8_t* anchor = src;
-    const uint8_t* p = src;
+    const uint8_t* anchor = src + startPos;
+    const uint8_t* p = src + startPos;
     size_t lastDist = 0;
 
     while (p < mfLimit) {
@@ -392,19 +394,10 @@ size_t compressBound(size_t srcSize) {
 //   u32 raw[5]   (uncompressed stream sizes)
 //   u32 enc[5]   (stored stream sizes)
 //   [tokens][exts][lits][offLo][offHi]
-size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap, int level) {
-    if (level < 0) level = 0;
-    if (level > 9) level = 9;
-    const LevelCfg& cfg = kLevels[level];
+namespace {
 
-    thread_local Streams s;
-    s.tokens.clear(); s.exts.clear(); s.lits.clear(); s.offLo.clear(); s.offHi.clear();
-    thread_local MatchFinder mf;
-    mf.reset();
-
-    if (!cfg.optimal || !optimalParse(src, srcSize, cfg, mf, s))
-        greedyParse(src, srcSize, cfg, cfg.depth, mf, s);
-
+// Entropy-codes and stores the 5 streams with the common header.
+size_t storeAll(const LevelCfg& cfg, const Streams& s, uint8_t* dst, size_t dstCap) {
     const size_t NS = 5;
     const size_t HDR = 1 + 2 * NS * 4;
     if (dstCap < HDR) return 0;
@@ -433,7 +426,54 @@ size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap,
     return (size_t)(d - dst);
 }
 
-size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawSize) {
+} // namespace
+
+size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap, int level) {
+    if (level < 0) level = 0;
+    if (level > 9) level = 9;
+    const LevelCfg& cfg = kLevels[level];
+
+    thread_local Streams s;
+    s.tokens.clear(); s.exts.clear(); s.lits.clear(); s.offLo.clear(); s.offHi.clear();
+    thread_local MatchFinder mf;
+    mf.reset();
+
+    if (!cfg.optimal || !optimalParse(src, srcSize, cfg, mf, s))
+        greedyParse(src, srcSize, cfg, cfg.depth, mf, s);
+
+    return storeAll(cfg, s, dst, dstCap);
+}
+
+size_t compressDict(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap, int level,
+                    const uint8_t* dict, size_t dictSize) {
+    if (!dict || dictSize == 0) return compress(src, srcSize, dst, dstCap, level);
+    if (level < 0) level = 0;
+    if (level > 9) level = 9;
+    const LevelCfg& cfg = kLevels[level];
+
+    // only the last window-size bytes of the dict are reachable via offsets
+    size_t dTail = dictSize < MAX_DIST ? dictSize : MAX_DIST;
+    thread_local std::vector<uint8_t> buf;
+    if (buf.size() < dTail + srcSize) buf.resize(dTail + srcSize);
+    std::memcpy(buf.data(), dict + (dictSize - dTail), dTail);
+    std::memcpy(buf.data() + dTail, src, srcSize);
+
+    thread_local Streams s;
+    s.tokens.clear(); s.exts.clear(); s.lits.clear(); s.offLo.clear(); s.offHi.clear();
+    thread_local MatchFinder mf;
+    mf.reset();
+    for (size_t i = 0; i + MIN_MATCH <= dTail; i++) mf.insert(buf.data(), i);
+
+    greedyParse(buf.data(), dTail + srcSize, cfg, cfg.depth, mf, s, dTail);
+    return storeAll(cfg, s, dst, dstCap);
+}
+
+namespace {
+
+// base..base+startOff is read-only prefix context (dict); output region is
+// [base+startOff, base+startOff+rawSize). Matches may reach into the prefix.
+size_t decompressInner(const uint8_t* src, size_t compSize, uint8_t* base, size_t startOff,
+                       size_t rawSize) {
     const size_t NS = 5;
     const size_t HDR = 1 + 2 * NS * 4;
     if (compSize < HDR) return 0;
@@ -475,8 +515,8 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
     const uint8_t* const litEnd = lit + raw[2];
     const uint8_t* const offEnd = offLo + raw[3];
 
-    uint8_t* op = dst;
-    uint8_t* const oend = dst + rawSize;
+    uint8_t* op = base + startOff;
+    uint8_t* const oend = op + rawSize;
     size_t lastDist = 0;
     auto readLen = [&](size_t base) -> size_t {
         size_t len = base;
@@ -493,7 +533,7 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
 
     // fast-path margin: short lit runs (<15) copy a fixed 16B block (wild),
     // skipping the variable-size memcpy and exact bounds checks
-    uint8_t* const oendSafe = rawSize > 64 ? oend - 64 : dst;
+    uint8_t* const oendSafe = rawSize > 64 ? oend - 64 : base + startOff;
 
     while (op < oend) {
         if (tok >= tokEnd) return 0;
@@ -520,7 +560,7 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
         size_t mLen = readLen(token & 0xf);
         if (mLen == SIZE_MAX) return 0;
         mLen += MIN_MATCH;
-        if (dist == 0 || (size_t)(op - dst) < dist || (size_t)(oend - op) < mLen) return 0;
+        if (dist == 0 || (size_t)(op - base) < dist || (size_t)(oend - op) < mLen) return 0;
         const uint8_t* m = op - dist;
         uint8_t* const cpEnd = op + mLen;
         if ((size_t)(oend - op) >= mLen + 8) {
@@ -550,6 +590,24 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
         }
     }
     return op == oend ? rawSize : 0;
+}
+
+} // namespace
+
+size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawSize) {
+    return decompressInner(src, compSize, dst, 0, rawSize);
+}
+
+size_t decompressDict(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawSize,
+                      const uint8_t* dict, size_t dictSize) {
+    if (!dict || dictSize == 0) return decompressInner(src, compSize, dst, 0, rawSize);
+    size_t dTail = dictSize < MAX_DIST ? dictSize : MAX_DIST;
+    thread_local std::vector<uint8_t> buf;
+    if (buf.size() < dTail + rawSize) buf.resize(dTail + rawSize);
+    std::memcpy(buf.data(), dict + (dictSize - dTail), dTail);
+    if (decompressInner(src, compSize, buf.data(), dTail, rawSize) != rawSize) return 0;
+    std::memcpy(dst, buf.data() + dTail, rawSize);
+    return rawSize;
 }
 
 } // namespace gdc1

@@ -20,6 +20,20 @@ public:
     virtual size_t compress(const void* src, size_t srcSize, void* dst, size_t dstCap, int level) const = 0;
     // rawSize is known by the caller. Returns rawSize on success, 0 on failure.
     virtual size_t decompress(const void* src, size_t compSize, void* dst, size_t rawSize) const = 0;
+
+    // Optional shared-dictionary support (T6). decompressDict must receive
+    // the same dict that was used to compress.
+    virtual bool supportsDict() const { return false; }
+    virtual size_t compressDict(const void* src, size_t srcSize, void* dst, size_t dstCap, int level,
+                                const void* dict, size_t dictSize) const {
+        (void)dict; (void)dictSize;
+        return compress(src, srcSize, dst, dstCap, level);
+    }
+    virtual size_t decompressDict(const void* src, size_t compSize, void* dst, size_t rawSize,
+                                  const void* dict, size_t dictSize) const {
+        (void)dict; (void)dictSize;
+        return decompress(src, compSize, dst, rawSize);
+    }
 };
 
 // Returns nullptr for unknown type. Instances are process-wide singletons.

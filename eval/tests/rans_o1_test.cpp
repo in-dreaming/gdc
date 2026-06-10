@@ -26,6 +26,24 @@ static void checkO1(const std::vector<uint8_t>& data, const char* tag) {
     }
 }
 
+static void checkGdc1Dict(const std::vector<uint8_t>& data, int level, const char* tag) {
+    if (data.size() < 8) return;
+    // first half = dict, second half = payload
+    size_t half = data.size() / 2;
+    const uint8_t* dict = data.data();
+    const uint8_t* src = data.data() + half;
+    size_t n = data.size() - half;
+    std::vector<uint8_t> enc(gdc1::compressBound(n));
+    size_t e = gdc1::compressDict(src, n, enc.data(), enc.size(), level, dict, half);
+    if (e == 0) { printf("GDC1D compress fail %s n=%zu\n", tag, n); failures++; return; }
+    std::vector<uint8_t> dec(n, 0xCD);
+    size_t d = gdc1::decompressDict(enc.data(), e, dec.data(), n, dict, half);
+    if (d != n || std::memcmp(dec.data(), src, n) != 0) {
+        printf("GDC1D FAIL %s n=%zu lvl=%d enc=%zu\n", tag, n, level, e);
+        failures++;
+    }
+}
+
 static void checkGdc1(const std::vector<uint8_t>& data, int level, const char* tag) {
     std::vector<uint8_t> enc(gdc1::compressBound(data.size()));
     size_t e = gdc1::compress(data.data(), data.size(), enc.data(), enc.size(), level);
@@ -185,8 +203,9 @@ int main(int argc, char** argv) {
         } else { // random (incompressible)
             for (auto& b : data) b = (uint8_t)rng();
         }
-        checkO1(data, "fuzz");
-        checkGdc1(data, (int)(rng() % 10), "fuzz");
+            checkO1(data, "fuzz");
+            checkGdc1(data, (int)(rng() % 10), "fuzz");
+            checkGdc1Dict(data, (int)(rng() % 10), "fuzz");
     }
     printf(failures ? "FAILURES: %d\n" : "all ok\n", failures);
     return failures ? 1 : 0;

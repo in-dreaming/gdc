@@ -42,6 +42,8 @@ struct RunOptions {
     // matrix mode only:
     std::vector<ResolvedCodec> matrixCodecs;
     uint64_t chunkSize = 0; // 0 = whole file; else compress in independent N-byte pages
+    uint64_t dictSize = 0;  // 0 = off; else build a shared dict (sampled from the
+                            // first entries) and use it for dict-capable codecs
 };
 
 struct RunResult {

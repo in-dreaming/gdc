@@ -33,6 +33,7 @@ static void usage() {
         "  --pkg <substr>   only packages whose name contains substr\n"
         "  --cat <ext>      only files whose source category (extension) equals ext\n"
         "  --chunk <n>      matrix: compress in independent n-byte pages (random-access sim)\n"
+        "  --dict <n>       matrix: build n-byte shared dict from first entries (gdc1/zstd)\n"
         "  --no-verify      skip roundtrip memcmp\n");
 }
 
@@ -82,6 +83,7 @@ int main(int argc, char** argv) {
         else if (a == "--cat") opt.catFilter = need("--cat");
         else if (a == "--codecs") codecSpec = need("--codecs");
         else if (a == "--chunk") opt.chunkSize = std::strtoull(need("--chunk"), nullptr, 10);
+        else if (a == "--dict") opt.dictSize = std::strtoull(need("--dict"), nullptr, 10);
         else if (a == "--no-verify") opt.verify = false;
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 1; }
     }
