@@ -14,6 +14,12 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap);
 // Returns rawSize on success, 0 on failure/corruption.
 size_t decode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t rawSize);
 
+// Order-1 variant: 16 contexts keyed by (previous byte >> 4). Larger table
+// overhead (16 tables) -> only profitable for big streams; caller A/Bs
+// against order-0 and picks the smaller result.
+size_t encodeO1(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap);
+size_t decodeO1(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t rawSize);
+
 // Worst-case encoded size for srcSize input.
 inline size_t bound(size_t srcSize) { return srcSize + srcSize / 64 + 512 + 4 + 64; }
 

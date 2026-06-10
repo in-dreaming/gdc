@@ -73,6 +73,13 @@ add_executable(gdceval
     src/gdc/gdc1.cpp)
 target_include_directories(gdceval PRIVATE src)
 target_link_libraries(gdceval PRIVATE zstd_ref lz4_ref lz3_ref oodle_ref)
+
+# ---------------- self tests ----------------
+add_executable(gdctest
+    tests/rans_o1_test.cpp
+    src/gdc/rans.cpp
+    src/gdc/gdc1.cpp)
+target_link_libraries(gdctest PRIVATE zstd_ref)
 if(MSVC)
     target_compile_options(gdceval PRIVATE /utf-8 /W3)
 endif()

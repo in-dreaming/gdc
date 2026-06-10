@@ -123,7 +123,9 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
         uint32_t& x = st[i & 3];
         uint8_t s = src[i];
         uint32_t f = freq[s];
-        uint32_t xMax = ((RANS_L >> SCALE_BITS) << 16) * f;
+        // 64-bit: f can be SCALE (single-symbol context) and 2^20*4096 = 2^32
+        // overflows u32 -> bogus renorms that desync the decoder
+        uint64_t xMax = ((uint64_t)(RANS_L >> SCALE_BITS) << 16) * f;
         if (x >= xMax) { // at most one 16-bit renorm per symbol
             if (out - tmp.data() < 2) return 0; // cannot shrink, bail out
             out -= 2;
@@ -239,6 +241,187 @@ size_t decode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t rawSize) 
         uint32_t& x = xs[i & 3];
         uint32_t e = T[x & (SCALE - 1)];
         dst[i] = (uint8_t)e;
+        x = (((e >> 8) & 0xfff) + 1) * (x >> SCALE_BITS) + (x & (SCALE - 1)) - (e >> 20);
+        if (x < RANS_L && p + 2 <= pend) {
+            x = (x << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+            p += 2;
+        }
+    }
+    return rawSize;
+}
+
+// ---------------- order-1 (16 contexts = prev byte >> 4) ----------------
+//
+// Layout: 16 x [u16 tableSize][table] (tableSize 0 = unused context)
+//         [u32 state0..3][payload]
+// Symbol schedule matches order-0: symbol i uses state (i & 3).
+
+size_t encodeO1(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
+    if (srcSize < 4 || dstCap < 64) return 0;
+
+    uint64_t hist[16][256] = {};
+    uint64_t total[16] = {};
+    uint8_t prev = 0;
+    for (size_t i = 0; i < srcSize; i++) {
+        uint32_t c = prev >> 4;
+        hist[c][src[i]]++;
+        total[c]++;
+        prev = src[i];
+    }
+    static thread_local uint16_t freq[16][256];
+    uint32_t cum[16][257];
+    for (int c = 0; c < 16; c++) {
+        if (total[c] == 0) continue;
+        if (!normalizeFreqs(hist[c], total[c], freq[c])) return 0;
+        cum[c][0] = 0;
+        for (int i = 0; i < 256; i++) cum[c][i + 1] = cum[c][i] + freq[c][i];
+    }
+
+    thread_local std::vector<uint8_t> tmp;
+    if (tmp.size() < srcSize + 64) tmp.resize(srcSize + 64);
+    uint8_t* const tmpEnd = tmp.data() + tmp.size();
+    uint8_t* out = tmpEnd;
+    uint32_t st[4] = {RANS_L, RANS_L, RANS_L, RANS_L};
+    for (size_t i = srcSize; i-- > 0;) {
+        uint32_t& x = st[i & 3];
+        uint32_t c = i ? (uint32_t)(src[i - 1] >> 4) : 0;
+        uint8_t s = src[i];
+        uint32_t f = freq[c][s];
+        uint64_t xMax = ((uint64_t)(RANS_L >> SCALE_BITS) << 16) * f; // see encode()
+        if (x >= xMax) {
+            if (out - tmp.data() < 2) return 0;
+            out -= 2;
+            out[0] = (uint8_t)(x & 0xff);
+            out[1] = (uint8_t)((x >> 8) & 0xff);
+            x >>= 16;
+        }
+        x = ((x / f) << SCALE_BITS) + (x % f) + cum[c][s];
+    }
+    size_t payload = (size_t)(tmpEnd - out);
+
+    uint8_t* d = dst;
+    uint8_t* const dend = dst + dstCap;
+    for (int c = 0; c < 16; c++) {
+        uint8_t table[3 * 256];
+        size_t tableSize = 0;
+        if (total[c] > 0) {
+            tableSize = writeFreqTable(freq[c], table, sizeof(table));
+            if (tableSize == 0) return 0;
+        }
+        if (d + 2 + tableSize > dend) return 0;
+        d[0] = (uint8_t)(tableSize & 0xff);
+        d[1] = (uint8_t)(tableSize >> 8);
+        d += 2;
+        std::memcpy(d, table, tableSize);
+        d += tableSize;
+    }
+    if (d + 16 + payload > dend) return 0;
+    for (int k = 0; k < 4; k++) {
+        d[0] = (uint8_t)(st[k] & 0xff);
+        d[1] = (uint8_t)((st[k] >> 8) & 0xff);
+        d[2] = (uint8_t)((st[k] >> 16) & 0xff);
+        d[3] = (uint8_t)((st[k] >> 24) & 0xff);
+        d += 4;
+    }
+    std::memcpy(d, out, payload);
+    d += payload;
+    size_t encSize = (size_t)(d - dst);
+    return encSize < srcSize ? encSize : 0;
+}
+
+#ifdef GDC_RANS_DEBUG
+#include <cstdio>
+#define RANS_DBG(...) std::fprintf(stderr, __VA_ARGS__)
+#else
+#define RANS_DBG(...)
+#endif
+
+size_t decodeO1(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t rawSize) {
+    const uint8_t* p = src;
+    const uint8_t* const pend = src + srcSize;
+
+    thread_local std::vector<uint32_t> tbl; // 16 contexts x SCALE entries
+    if (tbl.size() < 16 * SCALE) tbl.resize(16 * SCALE);
+    for (int c = 0; c < 16; c++) {
+        if (p + 2 > pend) return 0;
+        size_t tableSize = (size_t)(p[0] | (p[1] << 8));
+        p += 2;
+        if (tableSize == 0) continue; // unused context, table stays stale/unused
+        if (p + tableSize > pend) { RANS_DBG("o1: table %d overruns\n", c); return 0; }
+        uint16_t freq[256];
+        if (readFreqTable(p, tableSize, freq) != tableSize) { RANS_DBG("o1: table %d bad rle\n", c); return 0; }
+        p += tableSize;
+        uint32_t cum = 0;
+        uint32_t* T = tbl.data() + (size_t)c * SCALE;
+        for (int s = 0; s < 256; s++) {
+            uint32_t f = freq[s];
+            if (f == 0) continue;
+            uint32_t e = (uint32_t)s | ((f - 1) << 8) | (cum << 20);
+            for (uint32_t k = 0; k < f; k++) T[cum + k] = e;
+            cum += f;
+        }
+        if (cum != SCALE) { RANS_DBG("o1: ctx %d cum=%u != SCALE\n", c, cum); return 0; }
+    }
+    if (p + 16 > pend) { RANS_DBG("o1: no room for states\n"); return 0; }
+    uint32_t st[4];
+    for (int k = 0; k < 4; k++) {
+        st[k] = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        p += 4;
+    }
+
+    uint32_t x0 = st[0], x1 = st[1], x2 = st[2], x3 = st[3];
+    uint8_t prev = 0;
+    size_t i = 0;
+    for (; i + 4 <= rawSize; i += 4) {
+        const uint32_t* T0 = tbl.data() + ((size_t)(prev >> 4) << SCALE_BITS);
+        uint32_t e0 = T0[x0 & (SCALE - 1)];
+        uint8_t s0 = (uint8_t)e0;
+        dst[i] = s0;
+        x0 = (((e0 >> 8) & 0xfff) + 1) * (x0 >> SCALE_BITS) + (x0 & (SCALE - 1)) - (e0 >> 20);
+        if (x0 < RANS_L) {
+            if (p + 2 > pend) return 0;
+            x0 = (x0 << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+            p += 2;
+        }
+        const uint32_t* T1 = tbl.data() + ((size_t)(s0 >> 4) << SCALE_BITS);
+        uint32_t e1 = T1[x1 & (SCALE - 1)];
+        uint8_t s1 = (uint8_t)e1;
+        dst[i + 1] = s1;
+        x1 = (((e1 >> 8) & 0xfff) + 1) * (x1 >> SCALE_BITS) + (x1 & (SCALE - 1)) - (e1 >> 20);
+        if (x1 < RANS_L) {
+            if (p + 2 > pend) return 0;
+            x1 = (x1 << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+            p += 2;
+        }
+        const uint32_t* T2 = tbl.data() + ((size_t)(s1 >> 4) << SCALE_BITS);
+        uint32_t e2 = T2[x2 & (SCALE - 1)];
+        uint8_t s2 = (uint8_t)e2;
+        dst[i + 2] = s2;
+        x2 = (((e2 >> 8) & 0xfff) + 1) * (x2 >> SCALE_BITS) + (x2 & (SCALE - 1)) - (e2 >> 20);
+        if (x2 < RANS_L) {
+            if (p + 2 > pend) return 0;
+            x2 = (x2 << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+            p += 2;
+        }
+        const uint32_t* T3 = tbl.data() + ((size_t)(s2 >> 4) << SCALE_BITS);
+        uint32_t e3 = T3[x3 & (SCALE - 1)];
+        uint8_t s3 = (uint8_t)e3;
+        dst[i + 3] = s3;
+        x3 = (((e3 >> 8) & 0xfff) + 1) * (x3 >> SCALE_BITS) + (x3 & (SCALE - 1)) - (e3 >> 20);
+        if (x3 < RANS_L) {
+            if (p + 2 > pend) return 0;
+            x3 = (x3 << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+            p += 2;
+        }
+        prev = s3;
+    }
+    uint32_t xs[4] = {x0, x1, x2, x3};
+    for (; i < rawSize; i++) {
+        uint32_t& x = xs[i & 3];
+        const uint32_t* T = tbl.data() + ((size_t)(prev >> 4) << SCALE_BITS);
+        uint32_t e = T[x & (SCALE - 1)];
+        prev = (uint8_t)e;
+        dst[i] = prev;
         x = (((e >> 8) & 0xfff) + 1) * (x >> SCALE_BITS) + (x & (SCALE - 1)) - (e >> 20);
         if (x < RANS_L && p + 2 <= pend) {
             x = (x << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));

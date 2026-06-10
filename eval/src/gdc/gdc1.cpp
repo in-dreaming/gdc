@@ -117,12 +117,29 @@ uint32_t getU32(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-// Writes one stream: rANS if enabled and smaller, else raw. Returns stored size.
-size_t storeStream(const std::vector<uint8_t>& s, bool entropy, uint8_t* dst, size_t cap, bool& usedRans) {
-    usedRans = false;
+// Writes one stream, choosing the smallest of {raw, rANS-o0, rANS-o1}.
+// mode: 0 = raw, 1 = order-0, 2 = order-1. Returns stored size.
+size_t storeStream(const std::vector<uint8_t>& s, bool entropy, bool allowO1,
+                   uint8_t* dst, size_t cap, int& mode) {
+    mode = 0;
+    size_t best = SIZE_MAX;
     if (entropy && s.size() >= 256) {
         size_t r = rans::encode(s.data(), s.size(), dst, cap);
-        if (r > 0) { usedRans = true; return r; }
+        if (r > 0) { mode = 1; best = r; }
+        // o1 has 16 tables of overhead; only worth probing on larger streams
+        if (allowO1 && s.size() >= 16384) {
+            thread_local std::vector<uint8_t> alt;
+            if (alt.size() < cap) alt.resize(cap);
+            size_t r1 = rans::encodeO1(s.data(), s.size(), alt.data(), cap);
+            // o1 decode is ~2x slower (serialized context chain); demand a
+            // real ratio win before paying that
+            if (r1 > 0 && r1 + (best >> 5) < best) {
+                std::memcpy(dst, alt.data(), r1);
+                mode = 2;
+                best = r1;
+            }
+        }
+        if (mode != 0) return best;
     }
     if (s.size() > cap) return SIZE_MAX;
     std::memcpy(dst, s.data(), s.size());
@@ -136,7 +153,8 @@ size_t compressBound(size_t srcSize) {
 }
 
 // Layout:
-//   u8  flags (bit0..4 = tokens/exts/lits/offLo/offHi rANS-coded)
+//   u8  flags (bit0..4 = tokens/exts/lits/offLo/offHi rANS-coded,
+//              bit5 = lits stream uses order-1 rANS)
 //   u32 raw[5]   (uncompressed stream sizes)
 //   u32 enc[5]   (stored stream sizes)
 //   [tokens][exts][lits][offLo][offHi]
@@ -211,10 +229,11 @@ size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap,
     size_t enc[NS];
     uint8_t flags = 0;
     for (size_t k = 0; k < NS; k++) {
-        bool r;
-        enc[k] = storeStream(*streams[k], cfg.entropy, d, cap, r);
+        int mode;
+        enc[k] = storeStream(*streams[k], cfg.entropy, /*allowO1=*/k == 2, d, cap, mode);
         if (enc[k] == SIZE_MAX) return 0;
-        if (r) flags |= (uint8_t)(1 << k);
+        if (mode != 0) flags |= (uint8_t)(1 << k);
+        if (mode == 2) flags |= 32;
         d += enc[k]; cap -= enc[k];
     }
 
@@ -247,7 +266,10 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
     for (size_t k = 0; k < NS; k++) {
         if (flags & (1 << k)) {
             if (bufs[k].size() < raw[k]) bufs[k].resize(raw[k]);
-            if (rans::decode(p, enc[k], bufs[k].data(), raw[k]) != raw[k]) return 0;
+            const bool o1 = (k == 2) && (flags & 32);
+            size_t got = o1 ? rans::decodeO1(p, enc[k], bufs[k].data(), raw[k])
+                            : rans::decode(p, enc[k], bufs[k].data(), raw[k]);
+            if (got != raw[k]) return 0;
             sp[k] = bufs[k].data();
         } else {
             if (enc[k] != raw[k]) return 0;
