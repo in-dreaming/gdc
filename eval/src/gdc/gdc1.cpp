@@ -323,12 +323,26 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
         if (dist == 0 || (size_t)(op - dst) < dist || (size_t)(oend - op) < mLen) return 0;
         const uint8_t* m = op - dist;
         uint8_t* const cpEnd = op + mLen;
-        if (dist >= 8 && (size_t)(oend - op) >= mLen + 8) {
-            // wild copy: 8B chunks, may overshoot into the slack region
-            do {
+        if ((size_t)(oend - op) >= mLen + 8) {
+            // wild copy: 8B chunks, may overshoot into the slack region.
+            // dist < 8 first expands the pattern LZ4-style so subsequent
+            // 8B copies are overlap-safe.
+            if (dist < 8) {
+                static const unsigned incTab[8] = {0, 1, 2, 1, 0, 4, 4, 4};
+                static const int decTab[8] = {0, 0, 0, -1, -4, 1, 2, 3};
+                op[0] = m[0]; op[1] = m[1]; op[2] = m[2]; op[3] = m[3];
+                m += incTab[dist];
+                std::memcpy(op + 4, m, 4);
+                m -= decTab[dist];
+            } else {
+                std::memcpy(op, m, 8);
+                m += 8;
+            }
+            op += 8;
+            while (op < cpEnd) {
                 std::memcpy(op, m, 8);
                 op += 8; m += 8;
-            } while (op < cpEnd);
+            }
             op = cpEnd;
         } else {
             for (size_t i = 0; i < mLen; i++) op[i] = m[i]; // overlap-safe

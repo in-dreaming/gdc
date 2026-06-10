@@ -31,3 +31,5 @@ M2	gdc1:9	prefab2k	3.034	15.2	747.3	0	milestone	vs zstd@9 3.138, kraken@7 3.357
 M2	gdc1:9	bytes2k	2.202	59.2	1659.6	0	milestone	vs zstd@9 2.462 (small files: dictionaries needed, T6)
 M2	gdc1:9	anim2k	1.286	23.8	651.1	0	milestone	vs zstd@9 1.294: parity
 M2	gdc1:9	page16k-ress600	1.329	44.2	342.6	0	milestone	vs zstd@9 1.353/655, leviathan@5 1.432/676, kraken@7 1.417/1028. gap to leviathan -7.2%
+B2b	gdc1:9	asset2k	1.612	30.4	441.3	0	revert	tokens-stream o1: +0.06%, not worth encode cost
+B3b	gdc1:9	prefab2k	3.034	17.1	852.2	0	keep	dist<8 LZ4-style pattern expansion in wild-copy: prefab decomp +14%, ress +3%
