@@ -84,10 +84,25 @@ public:
 // trial-compress every candidate with zstd-1 (offline cost only) and keep
 // the winner; decode side just reads 1 tag byte per segment.
 // Layout: [u8 tag per segment][transformed segments back to back].
+void deltaFwd(const uint8_t* src, size_t n, uint8_t* dst) {
+    uint8_t prev = 0;
+    for (size_t i = 0; i < n; i++) { dst[i] = (uint8_t)(src[i] - prev); prev = src[i]; }
+}
+void deltaInv(const uint8_t* src, size_t n, uint8_t* dst) {
+    uint8_t acc = 0;
+    for (size_t i = 0; i < n; i++) { acc = (uint8_t)(acc + src[i]); dst[i] = acc; }
+}
+
 class AutoPlaneTransform final : public ITransform {
 public:
     static constexpr size_t SEG = 64 * 1024;
-    enum : uint8_t { TAG_COPY = 0, TAG_P4 = 1, TAG_P8 = 2, TAG_P16 = 3 };
+    // candidate modes per segment; PxDy = plane stride x then byte delta
+    // (delta after the split models slowly-varying same-significance bytes,
+    // i.e. float/int columns inside serialized objects)
+    enum : uint8_t {
+        TAG_COPY = 0, TAG_P2 = 1, TAG_P4 = 2, TAG_P8 = 3, TAG_P16 = 4,
+        TAG_D8 = 5, TAG_P4D = 6, TAG_P8D = 7, TAG_COUNT
+    };
 
     const char* name() const override { return "autoplane"; }
     size_t maxOutput(size_t n) const override { return n + numSegs(n) + 16; }
@@ -109,20 +124,17 @@ public:
             size_t pb = ZSTD_compressBound(len);
             if (probe.size() < pb) probe.resize(pb);
 
-            // candidate 0: copy
-            size_t bestSize = zstdProbe(sp, len, probe);
+            size_t bestSize = zstdProbe(sp, len, probe); // candidate: copy
             uint8_t bestTag = TAG_COPY;
-            static const size_t strides[3] = {4, 8, 16};
-            static const uint8_t tagOf[3] = {TAG_P4, TAG_P8, TAG_P16};
-            for (int c = 0; c < 3; c++) {
-                planeFwd(sp, len, cand.data(), strides[c]);
+            for (uint8_t tag = 1; tag < TAG_COUNT; tag++) {
+                applyFwd(sp, len, cand.data(), tag);
                 size_t sz = zstdProbe(cand.data(), len, probe);
                 // require a real margin: the probe codec (zstd-1) is weaker
                 // than the final backend, and the split costs cross-segment
                 // matches; small probe wins don't transfer
                 if (sz + (bestSize >> 4) < bestSize) {
                     bestSize = sz;
-                    bestTag = tagOf[c];
+                    bestTag = tag;
                 }
             }
             tags[s] = bestTag;
@@ -136,14 +148,25 @@ public:
         if (encN != nSeg + rawN) return 0;
         const uint8_t* tags = src;
         const uint8_t* in = src + nSeg;
+        thread_local std::vector<uint8_t> tmp;
         for (size_t s = 0; s < nSeg; s++) {
             const size_t off = s * SEG;
             const size_t len = (rawN - off < SEG) ? (rawN - off) : SEG;
+            const uint8_t* ip = in + off;
+            uint8_t* op = dst + off;
             switch (tags[s]) {
-                case TAG_COPY: std::memcpy(dst + off, in + off, len); break;
-                case TAG_P4:  planeInv(in + off, len, dst + off, 4); break;
-                case TAG_P8:  planeInv(in + off, len, dst + off, 8); break;
-                case TAG_P16: planeInv(in + off, len, dst + off, 16); break;
+                case TAG_COPY: std::memcpy(op, ip, len); break;
+                case TAG_P2:  planeInv(ip, len, op, 2); break;
+                case TAG_P4:  planeInv(ip, len, op, 4); break;
+                case TAG_P8:  planeInv(ip, len, op, 8); break;
+                case TAG_P16: planeInv(ip, len, op, 16); break;
+                case TAG_D8:  deltaInv(ip, len, op); break;
+                case TAG_P4D:
+                case TAG_P8D:
+                    if (tmp.size() < len) tmp.resize(len);
+                    deltaInv(ip, len, tmp.data());
+                    planeInv(tmp.data(), len, op, tags[s] == TAG_P4D ? 4 : 8);
+                    break;
                 default: return 0;
             }
         }
@@ -159,10 +182,19 @@ private:
     }
 
     static void applyFwd(const uint8_t* src, size_t n, uint8_t* dst, uint8_t tag) {
+        thread_local std::vector<uint8_t> tmp;
         switch (tag) {
+            case TAG_P2:  planeFwd(src, n, dst, 2); break;
             case TAG_P4:  planeFwd(src, n, dst, 4); break;
             case TAG_P8:  planeFwd(src, n, dst, 8); break;
             case TAG_P16: planeFwd(src, n, dst, 16); break;
+            case TAG_D8:  deltaFwd(src, n, dst); break;
+            case TAG_P4D:
+            case TAG_P8D:
+                if (tmp.size() < n) tmp.resize(n);
+                planeFwd(src, n, tmp.data(), tag == TAG_P4D ? 4 : 8);
+                deltaFwd(tmp.data(), n, dst);
+                break;
             default: std::memcpy(dst, src, n); break;
         }
     }
