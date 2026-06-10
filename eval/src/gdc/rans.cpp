@@ -118,9 +118,9 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
     if (tmp.size() < srcSize + 64) tmp.resize(srcSize + 64);
     uint8_t* const tmpEnd = tmp.data() + tmp.size();
     uint8_t* out = tmpEnd;
-    uint32_t st[2] = {RANS_L, RANS_L};
+    uint32_t st[4] = {RANS_L, RANS_L, RANS_L, RANS_L};
     for (size_t i = srcSize; i-- > 0;) {
-        uint32_t& x = st[i & 1];
+        uint32_t& x = st[i & 3];
         uint8_t s = src[i];
         uint32_t f = freq[s];
         uint32_t xMax = ((RANS_L >> SCALE_BITS) << 16) * f;
@@ -135,11 +135,11 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
     }
     size_t payload = (size_t)(tmpEnd - out);
 
-    // header: [u16 tableSize][table][u32 state0][u32 state1][payload]
+    // header: [u16 tableSize][table][u32 state0..3][payload]
     uint8_t table[3 * 256];
     size_t tableSize = writeFreqTable(freq, table, sizeof(table));
     if (tableSize == 0) return 0;
-    size_t encSize = 2 + tableSize + 8 + payload;
+    size_t encSize = 2 + tableSize + 16 + payload;
     if (encSize >= srcSize || encSize > dstCap) return 0;
 
     uint8_t* d = dst;
@@ -148,7 +148,7 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
     d += 2;
     std::memcpy(d, table, tableSize);
     d += tableSize;
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < 4; k++) {
         d[0] = (uint8_t)(st[k] & 0xff);
         d[1] = (uint8_t)((st[k] >> 8) & 0xff);
         d[2] = (uint8_t)((st[k] >> 16) & 0xff);
@@ -160,9 +160,9 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
 }
 
 size_t decode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t rawSize) {
-    if (srcSize < 2 + 8) return 0;
+    if (srcSize < 2 + 16) return 0;
     size_t tableSize = (size_t)(src[0] | (src[1] << 8));
-    if (2 + tableSize + 8 > srcSize) return 0;
+    if (2 + tableSize + 16 > srcSize) return 0;
     uint16_t freq[256];
     if (readFreqTable(src + 2, tableSize, freq) != tableSize) return 0;
     const uint8_t* p = src + 2 + tableSize;
@@ -187,35 +187,63 @@ size_t decode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t rawSize) 
         p += 4;
         return v;
     };
-    uint32_t x0 = readState();
-    uint32_t x1 = readState();
+    uint32_t st[4];
+    for (int k = 0; k < 4; k++) st[k] = readState();
     const uint8_t* const pend = src + srcSize;
     const uint32_t* const T = tbl.data();
 
-    // 2 symbols per iteration: the two states renorm independently, giving the
-    // CPU two dependency chains to overlap.
+    // 4 symbols per iteration: four independent dependency chains overlap in
+    // the CPU pipeline; each state renorms at most once (16-bit) per symbol.
+    uint32_t x0 = st[0], x1 = st[1], x2 = st[2], x3 = st[3];
     size_t i = 0;
-    for (; i + 2 <= rawSize; i += 2) {
-        uint32_t e0 = T[x0 & (SCALE - 1)];
-        dst[i] = (uint8_t)e0;
-        x0 = (((e0 >> 8) & 0xfff) + 1) * (x0 >> SCALE_BITS) + (x0 & (SCALE - 1)) - (e0 >> 20);
-        if (x0 < RANS_L) {
-            if (p + 2 > pend) return 0;
-            x0 = (x0 << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
-            p += 2;
-        }
-        uint32_t e1 = T[x1 & (SCALE - 1)];
-        dst[i + 1] = (uint8_t)e1;
-        x1 = (((e1 >> 8) & 0xfff) + 1) * (x1 >> SCALE_BITS) + (x1 & (SCALE - 1)) - (e1 >> 20);
-        if (x1 < RANS_L) {
-            if (p + 2 > pend) return 0;
-            x1 = (x1 << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
-            p += 2;
+    if (rawSize >= 4) {
+        for (; i + 4 <= rawSize; i += 4) {
+            uint32_t e0 = T[x0 & (SCALE - 1)];
+            dst[i] = (uint8_t)e0;
+            x0 = (((e0 >> 8) & 0xfff) + 1) * (x0 >> SCALE_BITS) + (x0 & (SCALE - 1)) - (e0 >> 20);
+            if (x0 < RANS_L) {
+                if (p + 2 > pend) return 0;
+                x0 = (x0 << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+                p += 2;
+            }
+            uint32_t e1 = T[x1 & (SCALE - 1)];
+            dst[i + 1] = (uint8_t)e1;
+            x1 = (((e1 >> 8) & 0xfff) + 1) * (x1 >> SCALE_BITS) + (x1 & (SCALE - 1)) - (e1 >> 20);
+            if (x1 < RANS_L) {
+                if (p + 2 > pend) return 0;
+                x1 = (x1 << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+                p += 2;
+            }
+            uint32_t e2 = T[x2 & (SCALE - 1)];
+            dst[i + 2] = (uint8_t)e2;
+            x2 = (((e2 >> 8) & 0xfff) + 1) * (x2 >> SCALE_BITS) + (x2 & (SCALE - 1)) - (e2 >> 20);
+            if (x2 < RANS_L) {
+                if (p + 2 > pend) return 0;
+                x2 = (x2 << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+                p += 2;
+            }
+            uint32_t e3 = T[x3 & (SCALE - 1)];
+            dst[i + 3] = (uint8_t)e3;
+            x3 = (((e3 >> 8) & 0xfff) + 1) * (x3 >> SCALE_BITS) + (x3 & (SCALE - 1)) - (e3 >> 20);
+            if (x3 < RANS_L) {
+                if (p + 2 > pend) return 0;
+                x3 = (x3 << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+                p += 2;
+            }
         }
     }
-    if (i < rawSize) {
-        uint32_t e0 = T[x0 & (SCALE - 1)];
-        dst[i] = (uint8_t)e0;
+    // tail: decode remaining symbols with their scheduled states (no renorm
+    // needed for correctness of the final symbols' values)
+    uint32_t xs[4] = {x0, x1, x2, x3};
+    for (; i < rawSize; i++) {
+        uint32_t& x = xs[i & 3];
+        uint32_t e = T[x & (SCALE - 1)];
+        dst[i] = (uint8_t)e;
+        x = (((e >> 8) & 0xfff) + 1) * (x >> SCALE_BITS) + (x & (SCALE - 1)) - (e >> 20);
+        if (x < RANS_L && p + 2 <= pend) {
+            x = (x << 16) | ((uint32_t)p[0] | ((uint32_t)p[1] << 8));
+            p += 2;
+        }
     }
     return rawSize;
 }
