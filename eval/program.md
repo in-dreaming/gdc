@@ -32,9 +32,10 @@
 ### 1.3 已实现的实验设施（`eval/`，C++17 + CMake）
 
 - 后端：`lz4 lz4hc lz3 lz3huf zstd kraken leviathan mermaid selkie none`（对照组），`gdc0`（贪心LZ占位）、**`gdc1`（自研后端，主迭代对象）**。
-- `gdc1` 架构（`src/gdc/gdc1.cpp`，M2 状态）：LZ77 hash-chain + 激进单步 lazy + rep-offset（64KB 窗口）→ 序列拆 **5 流**（tokens / lenExts / literals / offLo / offHi）→ 每流择优 {raw, rANS-o0, rANS-o1(仅 lits，3% 门槛)}。rANS：12-bit、16-bit renorm、4 路交织、RLE 频率表（`src/gdc/rans.cpp`）。解码：打包查表 + match wild-copy。level 0–9 控制搜索深度/lazy/熵开关。
+- `gdc1` 架构（`src/gdc/gdc1.cpp`，M3 状态）：LZ77 hash-chain + 激进单步 lazy + rep-offset（64KB 窗口）；**level 9 = 两遍价格模型 optimal parse**（贪心初遍 → 流直方图定价 → 前向 DP，超长匹配贪心跳过，>256KB 文件链深降 128）→ 序列拆 **5 流**（tokens / lenExts / literals / offLo / offHi）→ 每流择优 {raw, rANS-o0 内嵌表, rANS-o0 **静态预置表**（离线训练 5 张表/流类型，`static_tables.h`，0x8000|id 标签自动分发）, rANS-o1(仅 lits，3% 门槛)}。rANS：12-bit、16-bit renorm、4 路交织、RLE 频率表（`src/gdc/rans.cpp`）。解码：打包查表（静态表缓存免建表）+ match wild-copy + 短 lit 16B fast-path。**前缀字典**：`compressDict/decompressDict`（dict 尾部 ≤64KB 作窗口前缀，贪心解析）。
 - 转换层（`src/gdc/transforms.cpp`）：`plane2/4/8/16`、`delta8`、**`autoplane`**（64KB 分段每段试压选优，支持变长输出 + 自描述 tag）；管线语法 `autoplane+gdc1:9` 任意组合 transform 链 + 后端（PipelineCodec 每个 transform 存 u32 中间尺寸）。
-- 自测：`gdctest`（`tests/rans_o1_test.cpp`）= rANS o0/o1 + gdc1 全级别 fuzz roundtrip；带文件参数可对单个真实文件做诊断（只输出统计，不打印内容）。**改熵编码/码流格式后必跑。**
+- 字典实验：matrix 加 `--dict N`（从前 64 个 entry 头部采样拼接 N 字节共享字典，gdc1/zstd 走 dict 路径，其余 codec 不受影响）。
+- 自测：`gdctest`（`tests/rans_o1_test.cpp`）= rANS o0/o1 + gdc1 全级别 + dict 模式 fuzz roundtrip；带文件参数可对单个真实文件做诊断（只输出统计，不打印内容）；`train <root> <n>` 模式重新生成静态频率表。**改熵编码/码流格式后必跑。**
 - 评估命令（必须 roundtrip memcmp 全过，failures=0 才算合法实验）：
 
 ```powershell
@@ -56,7 +57,7 @@ cmake --build build --config Release -- /m
 
 ### 1.4 已消化的实验结论（务必先读，避免重复试错）
 
-详细日志见 `results.tsv`。截至 M2 里程碑（13 个实验，11 keep / 1 revert / 1 bugfix）：
+详细日志见 `results.tsv`。截至 M3 里程碑（19 个实验，16 keep / 2 revert / 1 bugfix）：
 
 **有效（已合入 gdc1/transform 层）**
 
@@ -68,6 +69,10 @@ cmake --build build --config Release -- /m
 - P1 激进 lazy（len2>len 即换）：+0.3~0.6%。
 - B2 literals order-1 rANS（16 上下文=前字节高 nibble，**流级 3% 收益门槛**）：asset +0.9%，无收益处自动回退 o0 保速度。
 - T1/B9 `autoplane` 变换（64KB 分段，每段 zstd-1 试压 {copy,p2,p4,p8,p16,d8,p4+d,p8+d} 选优，6% 门槛，1 字节 tag/段）：**asset +9~10%**（序列化资产内含数值数组段），anim/ress 中性。transform 对 zstd 同样有效（backend 无关）。
+- B8b 静态预置频率表（gdctest train 离线训练 5 张表/流类型，编码端与内嵌表逐流择优，0x8000|id 标签）+ 熵门槛 256→64：16KB 页 +0.8%、prefab +2.7%、bytes +3.4%；**解压 +45%**（静态表解码端缓存 slot table，免每页建表）。大文件中性（内嵌表已摊销）。
+- B6 价格模型 optimal parse（仅 level 9）：两遍法（贪心 → 流直方图 -log2(p) 定价 → 前向 DP，rep 沿路径近似跟踪）。ress +1.0%、page16k +0.5%、asset +0.4%、prefab +0.35%；autoplane+gdc1:9 asset 达 1.778 ≈ kraken@7 原文件水平。**平价 DP（无价格模型）≈ lazy，白做**——价格模型质量是 optimal parsing 的全部意义。压缩降至 2-5 MB/s（存档档位专用；level 8 保持 lazy 35 MB/s）。坑：长重复区 DP 逐位置 find() 是 O(n·len)，须 ≥1024 匹配贪心跳过。
+- D1 解码 lit fast-path（litLen<15 → 固定 16B wild copy，尾部 64B 边界余量）：ress 解压 +17%（483 MB/s）、prefab +10%（770）、page16k +6%。
+- T6 共享前缀字典（64KB，头部采样拼接）：**bytes 2.28→5.33 (+134%)**、prefab +3%；纹理 16KB 页仅 +0.4%（字典内容不对口，需按类型训练）。zstd+dict 6.06 仍领先（其字典含熵表预热）——gdc1 字典价值后续可叠加静态表按类型化。
 
 **无效/教训**
 
@@ -134,7 +139,7 @@ a1b2c3d	gdc1:9	ress1500	1.382	25.0	206.8	0	keep	baseline gdc1 v1
 - **T3 ETC2/BC 块的 8B stride 与子通道拆分**：移动端纹理可能混 ETC2(8B)。识别格式后选择 stride，并试"颜色端点字节 vs 调制位字节"分流。
 - **T4 序列化对象列化**：prefab/asset 是 Unity TypeTree 序列化流，同类型 object 的字段交错出现。试：同类 object 分组 + 字段列化（float 流、int 流、引用流分开）+ delta/varint。需要轻量解析序列化头（version、TypeTree 可从数据特征猜或借 UnityFS 文档）。预期 +30~50%（小文件场景配合字典）。
 - **T5 float 流 byte-grouping（ZipNN 思路）**：识别 float32/float16 数组区段（动画曲线、mesh），按字节平面拆 + 符号/指数分组。anim/fbx 类预期 +15~30%。
-- **T6 共享字典**：zstd dictionary API 已在源码里，按类型训练字典（`ZDICT_trainFromBuffer`），对 <16KB 的小 object 文件收益 30–50%。需要给 eval 加字典训练/加载路径。
+- ~~T6 共享字典~~ **已完成 v0**（`--dict N` 头部采样拼接字典；bytes +134%）。剩余空间：按类型/包训练专用字典、真正的后缀自动机式字典构造（zstd 源码无 dictBuilder，可自研简化版 cover 算法）、dict + 静态熵表联动、optimal parse 的 dict 支持。
 - **T7 对象分组与页策略**（直接回应业务痛点）：研究 prefab 多 object 拆/合的读放大模型——用 `--chunk` 扫 4K/16K/64K/256K 画 ratio-vs-页大小曲线，结合"对象平均大小"给出推荐粒度；进一步试"按 object 边界对齐页"（需要 T4 的解析）。产出应是策略表：什么类型 × 什么大小 → 什么粒度/分组。
 
 ### 3.2 自研后端 gdc1 → gdc2（速度与比率双修）
@@ -144,9 +149,9 @@ a1b2c3d	gdc1:9	ress1500	1.382	25.0	206.8	0	keep	baseline gdc1 v1
 - ~~B3 wild-copy~~ **已完成**（8B 块；dist<8 仍逐字节，可加 pattern 展开）。
 - ~~B4 rep-offset~~ **已完成**（offset=0 编码）。剩余空间：rep 参与 lazy 决策、2-3 字节短匹配 + rep（kraken 风格）。
 - ~~B5 更大窗口~~ **已试，负收益回退**（offset 成本 > 窗口收益；64KB+2B 是甜点）。若重试需配合 offset varint/熵建模。
-- **B6 optimal parsing**：level 9 改 price-based 最优解析；比率 +3~8%，仅离线档位。当前与 kraken 的 asset/prefab 差距主要在此。
+- ~~B6 optimal parsing~~ **已完成**（两遍价格模型 DP，全子集 +0.4~1.0%）。剩余空间：多候选匹配（每位置保留 top-K (len,dist) 而非仅最优）、DP 支持 dict 前缀、价格迭代（DP 结果再喂价格再 DP）。
 - ~~B7 流细分~~ **已完成**（5 流：tokens/exts/lits/offLo/offHi）。
-- ~~B8 freq 表 RLE~~ **已完成**。剩余空间：**B8b 静态预置表**（按数据类型离线训练，小块/16KB 页直接引用表 id，省 60-250B/流）。
+- ~~B8 freq 表 RLE~~ **已完成**。~~B8b 静态预置表~~ **已完成**（全局训练 5 张表）。剩余空间：**按数据类型分组训练**（纹理/序列化/表格各一套表，压缩端多试几张选优，解码端按 id 分发——现有 0x8000|id 机制直接支持扩表）。
 - ~~B9 块级自动选择~~ **autoplane 已实现**（变换级）。剩余空间：把 backend 候选也纳入（每段选 lz4-style vs gdc1 vs raw）。
 
 ### 3.3 容器化（GDC-Pack v0，迭代后期）
@@ -170,6 +175,7 @@ a1b2c3d	gdc1:9	ress1500	1.382	25.0	206.8	0	keep	baseline gdc1 v1
 |:--|:--|--:|--:|--:|:--|
 | 2026-06-10 | M1: gdc1 v1 + plane/delta transforms | 1.382 (gdc1@9), 207 MB/s | +1.5% | -7.9% | plane16 对 .ress 整文件负收益（容器未分段） |
 | 2026-06-10 | M2: 13 实验迭代（B8/B3/B1/B4/B7/P1/B2/autoplane） | 1.409 (gdc1@9), 413 MB/s | +3.5% | -6.1% | 解压速度翻倍；asset 上 autoplane+gdc1 1.759 超 zstd 8.9% |
+| 2026-06-11 | M3: B8b 静态表 + B6 optimal parse + D1 fast-path + T6 字典 | **1.4245** (gdc1@9), 483 MB/s | +2.2%* | -7.1%* | *zstd/kraken 未重测，对比 M2 参考值；bytes+dict 2.28→5.33 |
 
 M2 各类数据全景（`--limit 2000` × `--repeat 3`，ratio / decomp MB/s）：
 
@@ -190,10 +196,16 @@ M2 各类数据全景（`--limit 2000` × `--repeat 3`，ratio / decomp MB/s）�
 | leviathan@5（基准策略） | 1.432 | 676* | *无汇编构建，速度低估 |
 | kraken@7 | 1.417 | 1028* | |
 | zstd@9 | 1.353 | 655 | |
-| **gdc1@9 (M2)** | **1.329** | 343 | M1 时 1.279/632 → 比率 +3.9%；与 leviathan 差距 -7.2% |
+| **gdc1@9 (M3)** | **1.3465** | 489 | M2 时 1.329/343 → B8b+B6+D1；与 zstd 差 -0.5%，与 leviathan 差 -6.0% |
 | lz4hc@9 | 1.274 | 4168 | 速度档对照 |
 
-下一步高优先方向：页粒度比率差距主要在 freq 表残余开销与缺乏跨页上下文 → **B8b 静态预置表 / T6 共享字典**；asset/prefab 与 kraken 的差距 → **B6 optimal parsing**；解压速度 → token 主循环 fast-path（双 token 解码、分支削减）。
+M3 其它要点（详见 results.tsv）：ress1500 整文件 1.4245/483；asset autoplane+gdc1@9 **1.7784** ≈ kraken@7（1.78 量级，原文件粒度）；prefab 3.1261/770；bytes+64KB 字典 5.33/1018（zstd+dict 6.06）。
+
+下一步高优先方向：
+1. **静态表/字典按类型化**：page16k 残余差距与 bytes 落后 zstd+dict 的共同根因——一套全局表/一个头部字典不够对口。扩展 0x8000|id 静态表至按类型多套 + 按类型训练字典。
+2. **B6 延展**：DP 支持 dict 前缀（目前 dict 走贪心）、top-K 候选匹配。
+3. **解压速度**：距 zstd（655-950）仍差 ~30%。方向：双 token 解码、offset 流预解码消除分支、rANS SIMD。
+4. **T1 .ress 布局感知**（一直未做，潜在大头）：识别纹理 payload 边界，分段 transform 而非整文件。
 
 ---
 
@@ -202,12 +214,13 @@ M2 各类数据全景（`--limit 2000` × `--repeat 3`，ratio / decomp MB/s）�
 ```
 eval/
   program.md            ← 本文件（迭代时维护 §4）
-  results.tsv           ← 实验日志（不提交）
+  results.tsv           ← 实验日志
   src/gdc/              ← 主迭代区
-    gdc1.{h,cpp}          自研后端 v1（LZ + 3流 + rANS）
-    rans.{h,cpp}          order-0 rANS
+    gdc1.{h,cpp}          自研后端（LZ + 5流 + rANS + optimal parse + dict）
+    rans.{h,cpp}          rANS（o0 / o1 / 静态表）
+    static_tables.h       离线训练的静态频率表（gdctest train 再生成）
     transforms.{h,cpp}    感知压缩 transform 注册表
   src/codec.cpp         ← codec/transform spec 解析（"plane16+gdc1:7"）
-  src/bench.{h,cpp}     ← 评估 harness（baseline 路径勿动）
+  src/bench.{h,cpp}     ← 评估 harness（baseline 路径勿动；matrix 支持 --chunk/--dict）
 docs/research/方案研究-自研游戏数据压缩.md   ← 总体方案（档位 A/B/C/D 定义）
 ```

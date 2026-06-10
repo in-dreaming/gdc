@@ -33,3 +33,11 @@ M2	gdc1:9	anim2k	1.286	23.8	651.1	0	milestone	vs zstd@9 1.294: parity
 M2	gdc1:9	page16k-ress600	1.329	44.2	342.6	0	milestone	vs zstd@9 1.353/655, leviathan@5 1.432/676, kraken@7 1.417/1028. gap to leviathan -7.2%
 B2b	gdc1:9	asset2k	1.612	30.4	441.3	0	revert	tokens-stream o1: +0.06%, not worth encode cost
 B3b	gdc1:9	prefab2k	3.034	17.1	852.2	0	keep	dist<8 LZ4-style pattern expansion in wild-copy: prefab decomp +14%, ress +3%
+e568e78	B8b gdc1:9	page16k-ress600	1.340	51.6	495.9	0	keep	static trained freq tables (5 stream kinds, 0x8000|id tag) + entropy threshold 256->64: page16k ratio +0.8%, decomp +45% (cached static slot tables skip per-page table build); prefab +2.7% bytes +3.4%
+e568e78	B8b gdc1:9	ress1500	1.4097	27.1	420.6	0	keep	static tables neutral on big files (inline table amortized)
+d3f181b	B6 gdc1:9	ress1500	1.4244	2.6	410.8	0	keep	price-model optimal parse lvl9: 2-pass (greedy d32 -> per-symbol prices -> DP), rep tracked along path, >=1024 matches accepted greedily (avoids O(n*len) in runs), DP depth 128 for files >256KB / full 512 below: ress +1.0%
+d3f181b	B6 gdc1:9	asset2k	1.6196	4.0	463.6	0	keep	asset +0.4%; autoplane+gdc1:9 1.7784 (+1.0%) ~= kraken@7 raw-file level
+d3f181b	B6 gdc1:9	page16k-ress600	1.3465	1.8	461.5	0	keep	page16k +0.5% (gap to zstd@9 now -0.5%, leviathan -6.0%); prefab 3.1261 (+0.35%); lvl9 comp 2-5 MB/s = archive tier, lvl8 keeps lazy 35 MB/s
+d3f181b	B6-flat gdc1:9	asset2k	1.6130	2.9	494.5	0	superseded	flat-cost DP (no price model) ~= lazy: cost model quality is the whole point of optimal parsing
+318622b	D1 gdc1:9	ress1500	1.4245	1.8	482.5	0	keep	decoder lit fast-path (litLen<15 -> fixed 16B wild copy, 64B end margin): ress decomp +17%, prefab +10% (770), page16k +6% (489)
+4a57f17	T6 gdc1:8+dict64k	bytes2k	5.326	15.3	1017.6	0	keep	shared prefix dict (64KB head-sampled): bytes 2.28->5.33 (+134%); zstd@9+dict 6.06 (zstd dict entropy tables still ahead); prefab +3%, page16k +0.4% (texture pages don't match head-sample dict)
