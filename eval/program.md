@@ -31,9 +31,10 @@
 
 ### 1.3 已实现的实验设施（`eval/`，C++17 + CMake）
 
-- 后端：`lz4 lz4hc lz3 lz3huf zstd kraken leviathan mermaid selkie none`（对照组），`gdc0`（贪心LZ占位）、**`gdc1`（自研后端 v1，主迭代对象）**。
-- `gdc1` 架构（`src/gdc/gdc1.cpp`）：LZ77 hash-chain + 单步 lazy（64KB 窗口）→ 序列拆 3 流（tokens/literals/offsets）→ 每流独立 rANS（order-0, 12-bit，`src/gdc/rans.cpp`）或 raw 择优。level 0–9 控制搜索深度/lazy/熵开关。
-- 转换层（`src/gdc/transforms.cpp`）：`plane2/4/8/16`（字节平面拆分）、`delta8`（字节差分）；管线语法 `plane16+delta8+gdc1:7` 任意组合 transform 链 + 后端。
+- 后端：`lz4 lz4hc lz3 lz3huf zstd kraken leviathan mermaid selkie none`（对照组），`gdc0`（贪心LZ占位）、**`gdc1`（自研后端，主迭代对象）**。
+- `gdc1` 架构（`src/gdc/gdc1.cpp`，M2 状态）：LZ77 hash-chain + 激进单步 lazy + rep-offset（64KB 窗口）→ 序列拆 **5 流**（tokens / lenExts / literals / offLo / offHi）→ 每流择优 {raw, rANS-o0, rANS-o1(仅 lits，3% 门槛)}。rANS：12-bit、16-bit renorm、4 路交织、RLE 频率表（`src/gdc/rans.cpp`）。解码：打包查表 + match wild-copy。level 0–9 控制搜索深度/lazy/熵开关。
+- 转换层（`src/gdc/transforms.cpp`）：`plane2/4/8/16`、`delta8`、**`autoplane`**（64KB 分段每段试压选优，支持变长输出 + 自描述 tag）；管线语法 `autoplane+gdc1:9` 任意组合 transform 链 + 后端（PipelineCodec 每个 transform 存 u32 中间尺寸）。
+- 自测：`gdctest`（`tests/rans_o1_test.cpp`）= rANS o0/o1 + gdc1 全级别 fuzz roundtrip；带文件参数可对单个真实文件做诊断（只输出统计，不打印内容）。**改熵编码/码流格式后必跑。**
 - 评估命令（必须 roundtrip memcmp 全过，failures=0 才算合法实验）：
 
 ```powershell
@@ -53,20 +54,30 @@ cmake --build build --config Release -- /m
 .\build\Release\gdceval.exe baseline --data ..\tmp_ref\inner_data --threads 24
 ```
 
-### 1.4 首轮 A/B 结果（务必先消化，避免重复试错）
+### 1.4 已消化的实验结论（务必先读，避免重复试错）
 
-ress 子集（1500 文件 / 418MB，整文件压缩）：
+详细日志见 `results.tsv`。截至 M2 里程碑（13 个实验，11 keep / 1 revert / 1 bugfix）：
 
-| codec | ratio | comp MB/s | decomp MB/s | 结论 |
-|:--|--:|--:|--:|:--|
-| kraken@7 | 1.500 | 5.1 | 934 | 对照上限（无汇编构建，解压速度被低估） |
-| zstd@9 | 1.362 | 32 | 827 | 通用对照 |
-| **gdc1@9** | **1.382** | 25 | 207 | **比率已超 zstd@9**，解压速度差 4x（主要瓶颈：单状态 rANS + 逐字节匹配拷贝） |
-| plane16+zstd@9 | 1.314 | 37 | 597 | **负收益！** |
-| plane8+zstd@9 | 1.267 | 38 | 621 | 更差 |
-| plane16+delta8+zstd@9 | 1.275 | 36 | 558 | 更差 |
+**有效（已合入 gdc1/transform 层）**
 
-**重要教训**：`.ress` 不是裸 ASTC 块流——它是 Unity 序列化容器（可能多张纹理 + 多 mip 级 + 对齐填充），盲目按 16B stride 做平面拆分破坏了 LZ 可见的重复结构。感知压缩必须"先识别布局、再变换"，而不是全文件套公式（这正是方案文档里"块感知"的本意）。
+- B8 频率表 RLE 序列化（512B→~60-250B）+ 熵编码门槛 1024→256：16KB 页 +3.2%。
+- B3 解码 match wild-copy（8B 块拷贝，dist≥8）：解压 +8%。
+- B1 rANS 解码三连升级：2 路交织+打包查表(+57%) → 16-bit renorm 单分支(+0~20%) → 4 路交织(+16%)。解压 207→400+ MB/s。
+- B4 rep-offset（offset=0 表示重复上一个）：比率 +0.1%~，offsets 流变得高度偏斜利于 rANS。
+- B7 offsets 拆 lo/hi 两条独立熵流：ress +1.0%；lenExt 独立成第 5 条流：再 +0.2~0.4%。
+- P1 激进 lazy（len2>len 即换）：+0.3~0.6%。
+- B2 literals order-1 rANS（16 上下文=前字节高 nibble，**流级 3% 收益门槛**）：asset +0.9%，无收益处自动回退 o0 保速度。
+- T1/B9 `autoplane` 变换（64KB 分段，每段 zstd-1 试压 {copy,p2,p4,p8,p16,d8,p4+d,p8+d} 选优，6% 门槛，1 字节 tag/段）：**asset +9~10%**（序列化资产内含数值数组段），anim/ress 中性。transform 对 zstd 同样有效（backend 无关）。
+
+**无效/教训**
+
+- 全文件 plane16（首轮）与 autoplane-on-ress：`.ress` 纹理 payload 并非裸块流，平面拆分中性甚至负收益。感知压缩必须"先识别布局、再变换"。
+- B5 大窗口(2MB)+3B offsets：offset 成本 > 窗口收益（ress -1%），压缩速度崩(2MB/s)。64KB 窗口 + 2B offset 是当前数据的甜点。**回退**。
+- o1 literals 无门槛全开：ress 解压 396→184 MB/s 换 +0.5% 比率，Pareto 负。上下文链使 4 路交织失去 ILP——o1 只该用在收益大的流上。
+
+**正确性事故（必读）**
+
+- rANS `f == SCALE(4096)`（单符号上下文）时 `((L>>12)<<16)*f` 溢出 u32 → 编解码失步。fuzz 没抓到（需要"某 ctx 下 100% 单一符号"的真实数据）。修复：u64 xMax。**任何熵编码改动后必须跑 `gdctest`（fuzz）+ 大子集 roundtrip**。
 
 ---
 
@@ -128,15 +139,15 @@ a1b2c3d	gdc1:9	ress1500	1.382	25.0	206.8	0	keep	baseline gdc1 v1
 
 ### 3.2 自研后端 gdc1 → gdc2（速度与比率双修）
 
-- **B1 rANS 多路交织**：当前单状态、逐字节 renorm，解压 ~200MB/s。改 2/4 路交织状态 + 32-bit renorm（一次读 2 字节）可到 1GB/s 量级。参考 ryg 4-way SIMD 思路（compress2 报告有 NEON 版设计）。
-- **B2 literals 的 o1/拆分上下文**：literals 按 (pos&15) 或前字节高位分桶，多张 rANS 表；对纹理类数据等效于隐式 plane 拆分（可能比显式 transform 干净）。
-- **B3 匹配拷贝 wild-copy**：解码 match 改 16B 块拷贝（带 overlap 特判），literals memcpy 已有；预期解压 +30~50%。
-- **B4 rep-offset**：上一个 offset 复用（zstd/kraken 都有），token 腾 1 个 code 表示 rep；结构化数据收益明显。
-- **B5 更大窗口/2 级哈希**：64KB→1MB 窗口（offset 改 varint 或 3B），配合长距匹配表；大文件（db/usm 之外的 fbx、asset 批量）收益。注意运行时内存预算。
-- **B6 optimal parsing**：level 9 改 price-based 最优解析（compress2 报告有设计）；比率 +3~8%，仅离线档位。
-- **B7 offsets/length 流的专用编码**：offset 高低字节分流、length 直方图单独建模——目前 3 流已经分开，可再细分实验。
-- **B8 freq 表开销**：512B/流/块，16KB 页下显著。试：压缩 freq 表（增量/游程）、或小块退化为静态预置表（按数据类型离线训练几张表内置）。
-- **B9 块级自动选择**：每块试 {raw, lz-only, lz+rans} 取最小（已部分实现）；扩展为每块自动选 transform（带 1 字节 tag），即"mini-OpenZL 图"。
+- ~~B1 rANS 多路交织~~ **已完成**（4 路 + 16-bit renorm + 打包查表，解压 207→400+）。剩余空间：SIMD（SSE/AVX2 4-8 路向量化）、双 token 解码。
+- ~~B2 literals o1~~ **已完成**（16 ctx + 3% 门槛）。剩余空间：ctx 设计（pos&stride / 全前字节 256 ctx + 表共享）、tokens 流的 o1。
+- ~~B3 wild-copy~~ **已完成**（8B 块；dist<8 仍逐字节，可加 pattern 展开）。
+- ~~B4 rep-offset~~ **已完成**（offset=0 编码）。剩余空间：rep 参与 lazy 决策、2-3 字节短匹配 + rep（kraken 风格）。
+- ~~B5 更大窗口~~ **已试，负收益回退**（offset 成本 > 窗口收益；64KB+2B 是甜点）。若重试需配合 offset varint/熵建模。
+- **B6 optimal parsing**：level 9 改 price-based 最优解析；比率 +3~8%，仅离线档位。当前与 kraken 的 asset/prefab 差距主要在此。
+- ~~B7 流细分~~ **已完成**（5 流：tokens/exts/lits/offLo/offHi）。
+- ~~B8 freq 表 RLE~~ **已完成**。剩余空间：**B8b 静态预置表**（按数据类型离线训练，小块/16KB 页直接引用表 id，省 60-250B/流）。
+- ~~B9 块级自动选择~~ **autoplane 已实现**（变换级）。剩余空间：把 backend 候选也纳入（每段选 lz4-style vs gdc1 vs raw）。
 
 ### 3.3 容器化（GDC-Pack v0，迭代后期）
 
@@ -157,15 +168,32 @@ a1b2c3d	gdc1:9	ress1500	1.382	25.0	206.8	0	keep	baseline gdc1 v1
 
 | 日期 | 里程碑 | ress1500 ratio (gdc 最优) | vs zstd@9 | vs kraken@7 | 备注 |
 |:--|:--|--:|--:|--:|:--|
-| 2026-06-10 | gdc1 v1 + plane/delta transforms | 1.382 (gdc1@9) | +1.5% | -7.9% | plane16 对 .ress 整文件负收益（容器未分段） |
+| 2026-06-10 | M1: gdc1 v1 + plane/delta transforms | 1.382 (gdc1@9), 207 MB/s | +1.5% | -7.9% | plane16 对 .ress 整文件负收益（容器未分段） |
+| 2026-06-10 | M2: 13 实验迭代（B8/B3/B1/B4/B7/P1/B2/autoplane） | 1.409 (gdc1@9), 413 MB/s | +3.5% | -6.1% | 解压速度翻倍；asset 上 autoplane+gdc1 1.759 超 zstd 8.9% |
+
+M2 各类数据全景（`--limit 2000` × `--repeat 3`，ratio / decomp MB/s）：
+
+| 子集 | gdc1@9 | autoplane+gdc1@9 | zstd@9 | kraken@7* | gdc 相对 zstd |
+|:--|:--|:--|:--|:--|--:|
+| ress2k | **1.441** / 315 | 1.440 / 312 | 1.394 / 785 | 1.534 / 982 | **+3.4%** |
+| asset2k | 1.611 / 369 | **1.759** / 399 | 1.615 / 949 | 1.958 / 807 | **+8.9%** |
+| prefab2k | 3.034 / 747 | 3.031 / 777 | 3.138 / 1105 | 3.357 / 1742 | -3.3% |
+| bytes2k | 2.202 / 1660 | 2.191 / 1668 | 2.462 / 465 | 2.363 / 1084 | -10.6%（需 T6 字典） |
+| anim2k | 1.286 / 651 | 1.286 / 638 | 1.294 / 3464 | 1.319 / 2805 | -0.6% |
+
+*kraken 为无汇编构建，速度低估。
 
 16KB 页粒度（ress600 + `--chunk 16384`，对齐业务现状）：
 
 | codec | ratio | decomp MB/s | 备注 |
 |:--|--:|--:|:--|
-| leviathan@5（基准策略） | 1.432 | 477* | *无汇编构建，速度低估 |
-| zstd@9 | 1.353 | 592 | |
-| gdc1@9 | 1.279 | 632 | freq 表 512B×3/页 开销在 16KB 页下吃掉 ~5% → **B8 是高优先项** |
+| leviathan@5（基准策略） | 1.432 | 676* | *无汇编构建，速度低估 |
+| kraken@7 | 1.417 | 1028* | |
+| zstd@9 | 1.353 | 655 | |
+| **gdc1@9 (M2)** | **1.329** | 343 | M1 时 1.279/632 → 比率 +3.9%；与 leviathan 差距 -7.2% |
+| lz4hc@9 | 1.274 | 4168 | 速度档对照 |
+
+下一步高优先方向：页粒度比率差距主要在 freq 表残余开销与缺乏跨页上下文 → **B8b 静态预置表 / T6 共享字典**；asset/prefab 与 kraken 的差距 → **B6 optimal parsing**；解压速度 → token 主循环 fast-path（双 token 解码、分支削减）。
 
 ---
 

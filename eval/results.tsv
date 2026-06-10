@@ -16,3 +16,18 @@ T1/B9	autoplane+gdc1:9	ress1500	1.387	18.8	303.0	0	keep	autoplane(64KB seg, zstd
 T1/B9	autoplane+gdc1:9	asset2k	1.678	18.3	379.0	0	keep	vs gdc1:9 1.581: +6.2%! assets contain plane-friendly numeric arrays
 T1/B9	autoplane+zstd:9	asset2k	1.707	26.0	810.0	0	keep	transform also helps zstd +5.7% => transform layer is backend-agnostic win
 T1/B9	autoplane+gdc1:9	anim2k	1.283	24.0	477.0	0	keep	anim neutral
+T1b	autoplane+gdc1:9	asset2k	1.745	10.5	370.4	0	keep	autoplane candidates + {p2, delta8, plane4+delta, plane8+delta}: asset +4% more (total +10.4% vs raw gdc1)
+B1b	gdc1:9	ress1500	1.386	27.0	345.6	0	keep	16-bit renorm: branch instead of loop; asset decomp +20%
+B1c	gdc1:9	ress1500	1.388	29.0	401.6	0	keep	4-way interleaved rANS decode: ress decomp +16%
+B7	gdc1:9	ress1500	1.402	27.9	400.3	0	keep	offset lo/hi byte split into separate entropy streams: ress +1.0%
+B7	gdc1:9	page16k-ress600	1.326	58.6	478.2	0	keep	pages +0.4%
+P1	gdc1:9	ress1500	1.406	26.5	380.9	0	keep	aggressive lazy (len2>len): ress +0.3%, asset +0.6%
+B7b	gdc1:9	ress1500	1.409	29.0	396.3	0	keep	separate length-extension stream (5 streams total): +0.2~0.4% everywhere (repeat=3 timing showed no real decomp cost)
+B2	gdc1:9	asset2k	1.611	30.5	447.5	0	keep	order-1 lits (16 ctx by prev>>4), gated at 3% stream win: asset +0.9%, ress unaffected (o1 never wins 3% there)
+BUG	gdc1:9	asset2k	-	-	-	2	fixed	rANS u32 overflow at f=SCALE (single-symbol context) desynced decoder; found via real data, fixed w/ u64 xMax; fuzz+file test harness added (tests/rans_o1_test.cpp)
+M2	gdc1:9	ress2k	1.441	19.4	315.0	0	milestone	vs zstd@9 1.394/785, kraken@7 1.534/982 (kraken no-asm). gdc1 ratio now +3.4% over zstd
+M2	autoplane+gdc1:9	asset2k	1.759	10.0	399.1	0	milestone	vs zstd@9 1.615/949, kraken@7 1.958/807. transform+gdc1 +8.9% over zstd
+M2	gdc1:9	prefab2k	3.034	15.2	747.3	0	milestone	vs zstd@9 3.138, kraken@7 3.357
+M2	gdc1:9	bytes2k	2.202	59.2	1659.6	0	milestone	vs zstd@9 2.462 (small files: dictionaries needed, T6)
+M2	gdc1:9	anim2k	1.286	23.8	651.1	0	milestone	vs zstd@9 1.294: parity
+M2	gdc1:9	page16k-ress600	1.329	44.2	342.6	0	milestone	vs zstd@9 1.353/655, leviathan@5 1.432/676, kraken@7 1.417/1028. gap to leviathan -7.2%
