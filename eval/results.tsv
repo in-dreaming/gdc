@@ -1,0 +1,7 @@
+commit	experiment	dataset	ratio	comp_MBps	decomp_MBps	fail	status	description
+2b565a3	gdc1:9	ress1500	1.382	25.0	206.8	0	keep	baseline gdc1 v1 (3-stream LZ + order-0 rANS)
+2b565a3	gdc1:9	page16k-ress600	1.279	55.6	632.1	0	keep	baseline 16KB pages; freq table 512Bx3 overhead visible
+2b565a3	zstd:9	ress1500	1.362	31.8	827.2	0	keep	reference
+2b565a3	kraken:7	ress1500	1.500	5.1	933.8	0	keep	reference (no-asm build, speed understated)
+B8	gdc1:9	page16k-ress600	1.320	51.4	224.0	0	keep	RLE freq table + entropy threshold 256: ratio +3.2% on 16KB pages; decomp slower (more small streams entropy-coded), to be fixed by B1/B3
+B8	gdc1:9	ress1500	1.387	26.4	209.1	0	keep	whole-file ratio +0.4%

@@ -113,7 +113,7 @@ uint32_t getU32(const uint8_t* p) {
 // Writes one stream: rANS if enabled and smaller, else raw. Returns stored size.
 size_t storeStream(const std::vector<uint8_t>& s, bool entropy, uint8_t* dst, size_t cap, bool& usedRans) {
     usedRans = false;
-    if (entropy && s.size() >= 1024) {
+    if (entropy && s.size() >= 256) {
         size_t r = rans::encode(s.data(), s.size(), dst, cap);
         if (r > 0) { usedRans = true; return r; }
     }

@@ -44,10 +44,62 @@ bool normalizeFreqs(const uint64_t* hist, uint64_t total, uint16_t* freq) {
     return true;
 }
 
+// Compact freq table serialization (typ. 60-250B instead of 512B):
+//   byte 0x00:        zero run; next byte = run length (1..255)
+//   byte 1..254:      freq value, one symbol
+//   byte 0xFF:        escape; next 2 bytes = u16 LE freq (255..4096)
+size_t writeFreqTable(const uint16_t* freq, uint8_t* dst, size_t cap) {
+    size_t n = 0;
+    int i = 0;
+    while (i < 256) {
+        if (freq[i] == 0) {
+            int run = 0;
+            while (i < 256 && freq[i] == 0 && run < 255) { run++; i++; }
+            if (n + 2 > cap) return 0;
+            dst[n++] = 0x00;
+            dst[n++] = (uint8_t)run;
+        } else if (freq[i] < 255) {
+            if (n + 1 > cap) return 0;
+            dst[n++] = (uint8_t)freq[i];
+            i++;
+        } else {
+            if (n + 3 > cap) return 0;
+            dst[n++] = 0xFF;
+            dst[n++] = (uint8_t)(freq[i] & 0xff);
+            dst[n++] = (uint8_t)(freq[i] >> 8);
+            i++;
+        }
+    }
+    return n;
+}
+
+// Returns bytes consumed, 0 on corruption.
+size_t readFreqTable(const uint8_t* src, size_t srcSize, uint16_t* freq) {
+    size_t p = 0;
+    int i = 0;
+    while (i < 256) {
+        if (p >= srcSize) return 0;
+        uint8_t b = src[p++];
+        if (b == 0x00) {
+            if (p >= srcSize) return 0;
+            int run = src[p++];
+            if (run == 0 || i + run > 256) return 0;
+            for (int k = 0; k < run; k++) freq[i++] = 0;
+        } else if (b == 0xFF) {
+            if (p + 2 > srcSize) return 0;
+            freq[i++] = (uint16_t)(src[p] | (src[p + 1] << 8));
+            p += 2;
+        } else {
+            freq[i++] = b;
+        }
+    }
+    return p;
+}
+
 } // namespace
 
 size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
-    if (srcSize == 0 || dstCap < 512 + 4) return 0;
+    if (srcSize == 0 || dstCap < 16) return 0;
 
     uint64_t hist[256] = {0};
     for (size_t i = 0; i < srcSize; i++) hist[src[i]]++;
@@ -76,15 +128,20 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
         x = ((x / f) << SCALE_BITS) + (x % f) + cum[s];
     }
     size_t payload = (size_t)(tmpEnd - out);
-    size_t encSize = 512 + 4 + payload;
+
+    // header: [u16 tableSize][table][u32 state][payload]
+    uint8_t table[3 * 256];
+    size_t tableSize = writeFreqTable(freq, table, sizeof(table));
+    if (tableSize == 0) return 0;
+    size_t encSize = 2 + tableSize + 4 + payload;
     if (encSize >= srcSize || encSize > dstCap) return 0;
 
     uint8_t* d = dst;
-    for (int i = 0; i < 256; i++) {
-        d[0] = (uint8_t)(freq[i] & 0xff);
-        d[1] = (uint8_t)(freq[i] >> 8);
-        d += 2;
-    }
+    d[0] = (uint8_t)(tableSize & 0xff);
+    d[1] = (uint8_t)(tableSize >> 8);
+    d += 2;
+    std::memcpy(d, table, tableSize);
+    d += tableSize;
     d[0] = (uint8_t)(x & 0xff);
     d[1] = (uint8_t)((x >> 8) & 0xff);
     d[2] = (uint8_t)((x >> 16) & 0xff);
@@ -95,13 +152,12 @@ size_t encode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap) {
 }
 
 size_t decode(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t rawSize) {
-    if (srcSize < 512 + 4) return 0;
+    if (srcSize < 2 + 4) return 0;
+    size_t tableSize = (size_t)(src[0] | (src[1] << 8));
+    if (2 + tableSize + 4 > srcSize) return 0;
     uint16_t freq[256];
-    const uint8_t* p = src;
-    for (int i = 0; i < 256; i++) {
-        freq[i] = (uint16_t)(p[0] | (p[1] << 8));
-        p += 2;
-    }
+    if (readFreqTable(src + 2, tableSize, freq) != tableSize) return 0;
+    const uint8_t* p = src + 2 + tableSize;
     uint32_t cum[257];
     cum[0] = 0;
     for (int i = 0; i < 256; i++) {
