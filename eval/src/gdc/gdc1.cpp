@@ -90,15 +90,20 @@ void putLenExt(std::vector<uint8_t>& v, size_t len) {
     v.push_back((uint8_t)len);
 }
 
-void emitSeq(Streams& s, const uint8_t* lits, size_t litLen, size_t mLen, size_t dist) {
+// rep-offset: offset 0x0000 in the stream means "repeat previous offset".
+// Saves nothing in raw bytes but makes the offsets stream highly skewed
+// (rANS-friendly) and lets the parser pick cheap repeat matches.
+void emitSeq(Streams& s, const uint8_t* lits, size_t litLen, size_t mLen, size_t dist, size_t& lastDist) {
     size_t litCode = litLen < 15 ? litLen : 15;
     size_t mCode = mLen ? ((mLen - MIN_MATCH) < 15 ? (mLen - MIN_MATCH) : 15) : 0;
     s.tokens.push_back((uint8_t)((litCode << 4) | mCode));
     if (litLen >= 15) putLenExt(s.tokens, litLen - 15);
     s.lits.insert(s.lits.end(), lits, lits + litLen);
     if (mLen) {
-        s.offs.push_back((uint8_t)(dist & 0xff));
-        s.offs.push_back((uint8_t)(dist >> 8));
+        size_t enc = (dist == lastDist) ? 0 : dist;
+        s.offs.push_back((uint8_t)(enc & 0xff));
+        s.offs.push_back((uint8_t)(enc >> 8));
+        lastDist = dist;
         if (mLen - MIN_MATCH >= 15) putLenExt(s.tokens, mLen - MIN_MATCH - 15);
     }
 }
@@ -149,10 +154,20 @@ size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap,
     const uint8_t* const matchLimit = end - LAST_LITERALS;
     const uint8_t* anchor = src;
     const uint8_t* p = src;
+    size_t lastDist = 0;
 
     while (p < mfLimit) {
         size_t dist = 0;
         size_t len = mf.find(src, (size_t)(p - src), matchLimit, cfg.depth, dist);
+        // check repeat-offset match: ~free to encode, prefer when nearly as long
+        if (lastDist && (size_t)(p - src) >= lastDist && p + MIN_MATCH <= matchLimit) {
+            const uint8_t* c = p - lastDist;
+            if (read32(c) == read32(p)) {
+                size_t repLen = MIN_MATCH;
+                while (p + repLen < matchLimit && c[repLen] == p[repLen]) repLen++;
+                if (repLen + 1 >= len) { len = repLen; dist = lastDist; }
+            }
+        }
         if (len >= MIN_MATCH) {
             // single-step lazy: prefer a longer match starting one byte later
             if (cfg.lazy && p + 1 < mfLimit) {
@@ -165,7 +180,7 @@ size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap,
                     dist = dist2;
                 } else {
                     // keep match at p; position already inserted
-                    emitSeq(s, anchor, (size_t)(p - anchor), len, dist);
+                    emitSeq(s, anchor, (size_t)(p - anchor), len, dist, lastDist);
                     for (size_t k = 1; k < len && p + k + MIN_MATCH <= matchLimit; k++)
                         mf.insert(src, (size_t)(p - src) + k);
                     p += len;
@@ -173,7 +188,7 @@ size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap,
                     continue;
                 }
             }
-            emitSeq(s, anchor, (size_t)(p - anchor), len, dist);
+            emitSeq(s, anchor, (size_t)(p - anchor), len, dist, lastDist);
             for (size_t k = 0; k < len && p + k + MIN_MATCH <= matchLimit; k++)
                 mf.insert(src, (size_t)(p - src) + k);
             p += len;
@@ -183,7 +198,7 @@ size_t compress(const uint8_t* src, size_t srcSize, uint8_t* dst, size_t dstCap,
             p++;
         }
     }
-    emitSeq(s, anchor, (size_t)(end - anchor), 0, 0); // terminal literal run
+    emitSeq(s, anchor, (size_t)(end - anchor), 0, 0, lastDist); // terminal literal run
 
     const size_t HDR = 1 + 6 * 4;
     if (dstCap < HDR) return 0;
@@ -243,6 +258,7 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
 
     uint8_t* op = dst;
     uint8_t* const oend = dst + rawSize;
+    size_t lastDist = 0;
     auto readLen = [&](size_t base) -> size_t {
         size_t len = base;
         if (base == 15) {
@@ -269,6 +285,8 @@ size_t decompress(const uint8_t* src, size_t compSize, uint8_t* dst, size_t rawS
         if ((size_t)(offEnd - off) < 2) return 0;
         size_t dist = (size_t)off[0] | ((size_t)off[1] << 8);
         off += 2;
+        if (dist == 0) dist = lastDist; // rep-offset
+        else lastDist = dist;
         size_t mLen = readLen(token & 0xf);
         if (mLen == SIZE_MAX) return 0;
         mLen += MIN_MATCH;
