@@ -2,3 +2,6 @@
 zig-out/
 *.o
 tmp_ref/
+eval/build/
+eval/out/
+eval/results.tsv
